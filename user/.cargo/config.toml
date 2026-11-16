@@ -1,0 +1,3 @@
+# Programs for GlassOS: static ELFs the kernel runs in ring 3.
+[build]
+target = "x86_64-unknown-none"

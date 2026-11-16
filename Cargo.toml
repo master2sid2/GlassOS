@@ -1,0 +1,28 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+libm = "0.2"
+lewton = { path = "third_party/lewton" }
+nanomp3 = { version = "0.2", default-features = false, features = ["alloc", "wide", "layer12"] }
+linked_list_allocator = "0.10"
+spinning_top = "0.2"
+uefi = { version = "0.41", default-features = false, features = ["alloc"] }
+
+[features]
+# Debugging tools (remote keyboard and mouse and the like). To build without them:
+# cargo build --release --no-default-features. To remove them completely — find everything by "debug-tools".
+default = ["debug-tools"]
+debug-tools = []
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+# The kernel is one program: build it as a whole so the optimizer sees everything at once.
+lto = "fat"
+codegen-units = 1

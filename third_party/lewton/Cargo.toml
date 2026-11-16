@@ -1,0 +1,13 @@
+# lewton 0.10.2 (https://github.com/RustAudio/lewton, MIT OR Apache-2.0), converted
+# to no_std for GlassOS: a std replacement module in lib.rs, math through libm, no ogg
+# (the kernel parses the Ogg container). The changes are marked with "GlassOS" comments.
+[package]
+name = "lewton"
+version = "0.10.2"
+edition = "2015"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+libm = "0.2"
+tinyvec = { version = "1.0", default-features = false, features = ["alloc"] }

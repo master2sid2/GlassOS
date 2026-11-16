@@ -1,0 +1,42 @@
+//! Built-in applications. They live in the kernel itself.
+
+mod about;
+pub mod accounts;
+mod clock;
+pub mod disks;
+pub mod connect;
+pub mod datetime;
+pub mod dialog;
+mod files;
+mod installer;
+mod languages;
+pub mod login;
+mod lua_syntax;
+pub mod menuedit;
+mod notepad;
+mod btcfg;
+mod netcfg;
+mod paint;
+mod recorder;
+mod settings;
+mod taskmgr;
+mod terminal;
+pub mod transfer;
+pub mod ui;
+mod viewer;
+
+pub use about::About;
+pub use clock::Clock;
+pub use dialog::FileDialog;
+pub use files::Files;
+pub use installer::Installer;
+pub use btcfg::BtSettings;
+pub use netcfg::NetSettings;
+pub use notepad::Notepad;
+pub use paint::Paint;
+pub use recorder::Recorder;
+pub use terminal::run_headless;
+pub use viewer::Viewer;
+pub use settings::Settings;
+pub use taskmgr::TaskManager;
+pub use terminal::Terminal;

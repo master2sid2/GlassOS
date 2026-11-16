@@ -1,0 +1,10 @@
+[build]
+# Our own target: like x86_64-unknown-uefi, but with hardware SSE instead of software
+# floating point (sound, pictures and fonts are computed many times faster). The FPU/SSE
+# state is saved by the interrupt entry points (interrupts.rs).
+target = "x86_64-glassos.json"
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

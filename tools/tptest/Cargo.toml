@@ -1,0 +1,11 @@
+# Touchpad and DSDT parsing tests on the host:
+#   cargo test --manifest-path tools/tptest/Cargo.toml --target x86_64-unknown-linux-gnu
+[package]
+name = "tptest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libm = "0.2"
+
+[workspace]

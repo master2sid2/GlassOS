@@ -1,0 +1,4 @@
+[toolchain]
+# Nightly is needed for our own build target (build-std): the kernel is built with SSE.
+channel = "nightly"
+components = ["rust-src"]

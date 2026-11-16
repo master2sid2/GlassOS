@@ -1,0 +1,19 @@
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "glass"
+path = "src/lib.rs"
+
+[dependencies]
+linked_list_allocator = "0.10"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.dev]
+panic = "abort"

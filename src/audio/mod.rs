@@ -116,6 +116,9 @@ trait Hw: Send {
     fn jack(&mut self) -> Option<bool> {
         None
     }
+    /// Once a tick: follow the microphone jack and, while `recording`, move the recorded
+    /// samples to the system's input.
+    fn capture(&mut self, _recording: bool) {}
 }
 
 /// Where sound goes: 0 — unknown (no sensor), 1 — speakers, 2 — headphones.
@@ -263,12 +266,13 @@ pub fn choose_output(name: &str) {
     save_choices();
 }
 
-/// The input we record from: the chosen one if present, otherwise the first.
+/// The input we record from: the chosen one if present, otherwise the last connected one
+/// (a headset plugged in or paired after boot wins over the built-in microphone).
 fn active_input() -> Option<InputRef> {
     load_choices();
     let list = INPUTS.lock();
     let choice = IN_CHOICE.lock().clone();
-    list.iter().find(|i| Some(&i.lock().name) == choice.as_ref()).or(list.first()).cloned()
+    list.iter().find(|i| Some(&i.lock().name) == choice.as_ref()).or(list.last()).cloned()
 }
 
 pub fn current_input() -> Option<String> {
@@ -312,7 +316,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Start recording from the current input (the first one; the choice is in the sound settings).
+    /// Start recording from the current input (the last connected one; the choice is in the sound settings).
     pub fn start() -> Capture {
         RECORDING.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let input = active_input();
@@ -597,6 +601,9 @@ impl Card {
 
     /// Once a tick: keeps the buffers ahead of the playing one filled.
     fn service(&mut self) {
+        if let Some(hw) = &mut self.hw {
+            hw.capture(recording());
+        }
         let stream = stream_for(self.hw.is_some());
         ABSOLUTE.store(stream.as_ref().is_some_and(|s| s.lock().absolute), core::sync::atomic::Ordering::Relaxed);
         if let Some(s) = stream {

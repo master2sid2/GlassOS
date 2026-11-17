@@ -28,7 +28,7 @@ its SATA disk and updated over the network with trial kernels.
 | Wi-Fi | Realtek RTL8723BE | ⚠️ | WPA2-PSK, reconnects after a drop, group key renewal; ~1.5 MB/s upload with a fixed rate. The firmware gives the card no PCI address (the driver assigns one). Its receive DMA can hang until a full power-off |
 | Bluetooth | Realtek RTL8723B (USB, same card) | ✅ | Keyboards and mice (LE, HID over GATT), headphones (A2DP, buttons, absolute volume), headset microphone (HFP). Heavy Wi-Fi traffic can disturb audio |
 | USB | xHCI | ✅ | Keyboards, mice, sticks, hubs, USB Ethernet |
-| Sound | Intel HDA | ⚠️ | Headphone jack works. A microphone on the jack is not used: recording only supports Bluetooth headsets so far |
+| Sound | Intel HDA (Realtek ALC283) | ⚠️ | Headphone jack works. The headset microphone (pin 0x19, which the firmware does not describe) is set up but not tested yet |
 | Watchdog | TCO | ✅ | Resets the board 30–60 s after a hard hang |
 | Power | | ⚠️ | Deep C-states and sensors work; no sleep/hibernate |
 
@@ -40,6 +40,7 @@ Laptop, Intel Comet Lake. Runs as a live system from a USB stick (its NVMe disk 
 |---|---|---|---|
 | Boot | Dell UEFI | ✅ | From a USB stick (ISO on Ventoy or the USB image); Secure Boot off |
 | Display | Built-in panel (GOP) | ✅ | Firmware mode, brightness from Settings |
+| GPU acceleration | Intel UHD Graphics (Gen9.5, 8086:9B41) | ✅ | The blitter copies frames to the screen (self-check pixel by pixel); no 3D engine yet. `gpu off` hands output back to the CPU |
 | External monitor | HDMI (DDI B through a DP→HDMI converter) | ✅ | Own driver, modes from the monitor EDID |
 | Brightness keys | Fn brightness keys | ❌ | The firmware sends them through an SMI path GlassOS does not handle yet |
 | Keyboard | PS/2 | ✅ | Keyboard backlight (Fn+F5) is handled by the firmware |
@@ -48,7 +49,7 @@ Laptop, Intel Comet Lake. Runs as a live system from a USB stick (its NVMe disk 
 | Wi-Fi | Intel Wi-Fi 6 AX201 | ⚠️ | Experimental driver; copying over Wi-Fi measured at 8–10 MB/s |
 | Bluetooth | Intel AX201 (USB 8087:0026) | ⚠️ | Firmware loads, keyboards pair; key auto-repeat may stick while Wi-Fi is busy |
 | Battery, lid | Embedded controller | ✅ | Charge, time left, lid closes the screen |
-| Sound | Intel HDA | ⚠️ | Speakers and headphone jack work. A microphone on the jack is not used: recording only supports Bluetooth headsets so far |
+| Sound | Intel HDA (Realtek ALC295) | ⚠️ | Speakers and headphone jack work. The built-in microphone records (signal checked, voice not yet); the headset microphone on the jack is set up but not tested |
 | Power | | ⚠️ | No sleep/hibernate; deep C-states not verified |
 
 ## QEMU/KVM

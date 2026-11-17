@@ -5,8 +5,13 @@
 //! it is a graph of nodes (DACs, mixers, selectors, output "pins"). We find the outputs
 //! (speakers, headphones, line out), lay a path from each to a DAC,
 //! remove "mute" along the way and feed our stream to the DAC: 48 kHz, 16-bit, stereo.
+//!
+//! Recording goes the other way: from a microphone pin (the headset jack, a built-in
+//! microphone, line in) through selectors to an ADC, whose stream lands in a ring in memory.
+//! The jack is watched like the headphone jack: plug a headset in and recording switches to it,
+//! pull it out and the built-in microphone (if any) takes over.
 
-use super::{BUFFER_BYTES, BUFFERS, Hw, RATE};
+use super::{BUFFER_BYTES, BUFFERS, Hw, InputRef, RATE};
 use crate::interrupts::{self, HZ};
 use crate::kprintln;
 use crate::pci;
@@ -71,6 +76,7 @@ const P_OUT_AMP: u32 = 0x12;
 
 // Node types.
 const W_OUTPUT: u32 = 0;
+const W_INPUT: u32 = 1;
 const W_MIXER: u32 = 2;
 const W_SELECTOR: u32 = 3;
 const W_PIN: u32 = 4;
@@ -79,6 +85,14 @@ const W_PIN: u32 = 4;
 const FORMAT: u16 = 0x0011;
 /// Our stream number (the tag by which the DAC recognises its data).
 const STREAM_TAG: u32 = 1;
+/// The recording stream's tag (the ADC sends its data under it).
+const CAPTURE_TAG: u32 = 2;
+/// The recording ring: 16 pieces of 4 KiB, ~340 ms at 48 kHz stereo — the mixer thread
+/// collects it every 10 ms, so a late tick loses nothing.
+const CAPTURE_BUFS: usize = 16;
+const CAPTURE_BYTES: usize = 4096;
+/// Do not read the last bytes before the DMA position: the controller may not have written them yet.
+const CAPTURE_GUARD: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -100,8 +114,33 @@ struct OutPin {
     trigger: bool,
 }
 
+/// A codec input: a microphone or line-in pin and how to route it to an ADC.
+struct InPin {
+    codec: u32,
+    nid: u32,
+    /// The ADC at the start of the path.
+    adc: u32,
+    name: &'static str,
+    /// A jack whose plug can be sensed (a built-in microphone is always there).
+    jack: bool,
+    trigger: bool,
+    /// The commands that route this pin to its ADC and our capture stream.
+    route: Vec<(u32, u32, u32)>,
+}
+
 pub struct Hda {
     pins: Vec<OutPin>,
+    inputs: Vec<InPin>,
+    /// The input recorded from now (index in `inputs`) and its entry in the system's input list.
+    mic: Option<(usize, InputRef)>,
+    mic_checked: u64,
+    /// The register block of the capture stream (0 — the controller has none).
+    cap_sd: usize,
+    cap_bdl: *mut Bdle,
+    cap_buf: *mut u8,
+    /// How far into the ring we have read, in bytes; whether the stream runs.
+    cap_read: usize,
+    cap_running: bool,
     /// Headphones are plugged in (speakers off).
     headphones: bool,
     jack_checked: u64,
@@ -306,6 +345,72 @@ impl Codec<'_> {
         None
     }
 
+    /// The path from an ADC down to pin `pin`: [ADC, ..., pin]; depth no more than 5.
+    fn path_from(&self, nid: u32, pin: u32, depth: usize) -> Option<Vec<u32>> {
+        if nid == pin {
+            return Some(alloc::vec![nid]);
+        }
+        let w = self.widget(nid)?;
+        if depth == 0 || !matches!(w.kind, W_INPUT | W_MIXER | W_SELECTOR) {
+            return None;
+        }
+        for &c in &w.conns {
+            if let Some(mut rest) = self.path_from(c, pin, depth - 1) {
+                rest.insert(0, nid);
+                return Some(rest);
+            }
+        }
+        None
+    }
+
+    /// The commands that route an input path [ADC, ..., pin] to the capture stream: power,
+    /// input selection, amplifiers at 0 dB, the microphone boost one step up, the pin as an input
+    /// with microphone bias.
+    fn input_route(&mut self, path: &[u32], vref: u32) -> Vec<(u32, u32, u32)> {
+        let mut cmds = Vec::new();
+        for (i, &nid) in path.iter().enumerate() {
+            cmds.push((nid, SET_POWER, 0));
+            let caps = self.widget(nid).map_or(0, |w| w.caps);
+            let kind = self.widget(nid).map_or(0, |w| w.kind);
+            if caps & 1 << 2 != 0 {
+                cmds.push(self.amp_cmd(nid, true, 0, None));
+            }
+            if let Some(&next) = path.get(i + 1) {
+                let index = self.widget(nid).and_then(|w| w.conns.iter().position(|&c| c == next)).unwrap_or(0) as u32;
+                if kind != W_MIXER && self.widget(nid).is_some_and(|w| w.conns.len() > 1) {
+                    cmds.push((nid, SET_CONN_SELECT, index));
+                }
+                if caps & 1 << 1 != 0 {
+                    cmds.push(self.amp_cmd(nid, false, index, None));
+                }
+            } else if kind == W_PIN && caps & 1 << 1 != 0 {
+                // The pin's own input amplifier is the microphone boost (often +10 dB a step).
+                cmds.push(self.amp_cmd(nid, false, 0, Some(1)));
+            }
+            if kind == W_INPUT {
+                cmds.push((nid, SET_FORMAT, FORMAT as u32));
+                cmds.push((nid, SET_STREAM, CAPTURE_TAG << 4));
+            }
+        }
+        if let Some(&pin) = path.last() {
+            cmds.push((pin, SET_PIN_CTL, 0x20 | vref));
+        }
+        cmds
+    }
+
+    /// An amplifier command: unmuted, at 0 dB (or `steps` above the minimum, or the maximum if there is no 0 dB).
+    fn amp_cmd(&mut self, nid: u32, output: bool, index: u32, steps: Option<u32>) -> (u32, u32, u32) {
+        let caps = self.amp_caps(nid, output);
+        let (offset, max) = (caps & 0x7F, (caps >> 8) & 0x7F);
+        let gain = match steps {
+            Some(n) => n.min(max),
+            None if offset > 0 => offset,
+            None => max,
+        };
+        let dir = if output { 1 << 15 } else { 1 << 14 };
+        (nid, SET_AMP, dir | 0x3000 | index << 8 | gain.min(0x7F))
+    }
+
     fn amp_caps(&mut self, nid: u32, output: bool) -> u32 {
         let w = self.widget(nid).map_or(0, |w| w.caps);
         // Bit 3: the node has its own amplifier parameters, otherwise the group's shared ones.
@@ -378,6 +483,19 @@ fn setup_codec(hda: &mut Hda, addr: u32) -> Option<String> {
         widgets.push((nid, Widget { kind: (caps >> 20) & 0xF, caps, conns }));
     }
     let mut codec = Codec { hda, addr, widgets, afg_out_amp, afg_in_amp };
+    // Every pin with its configuration default and capabilities: the starting point for
+    // supporting a new codec from a log.
+    for (nid, w) in codec.widgets.iter().filter(|(_, w)| w.kind == W_PIN).map(|(n, w)| (*n, w.conns.clone())).collect::<Vec<_>>() {
+        let config = codec.hda.cmd(addr, nid, GET_CONFIG, 0).unwrap_or(0);
+        let caps = codec.hda.param(addr, nid, P_PIN_CAPS);
+        kprintln!("audio: codec {addr} pin {nid:#x}: config {config:08x} caps {caps:08x} conns {w:x?}");
+    }
+    let adcs: Vec<(u32, Vec<u32>)> = codec.widgets.iter().filter(|(_, w)| w.kind == W_INPUT).map(|(n, w)| (*n, w.conns.clone())).collect();
+    for (nid, conns) in &adcs {
+        let feeds: Vec<(u32, Vec<u32>)> =
+            conns.iter().filter_map(|c| codec.widget(*c).filter(|w| w.kind != W_PIN).map(|w| (*c, w.conns.clone()))).collect();
+        kprintln!("audio: codec {addr} ADC {nid:#x} <- {conns:x?} {feeds:x?}");
+    }
 
     // Outputs: pins capable of outputting sound, physically connected,
     // with the purpose "line out", "speaker" or "headphones".
@@ -406,6 +524,49 @@ fn setup_codec(hda: &mut Hda, addr: u32) -> Option<String> {
         kprintln!("audio: codec {addr} pin {nid:#x} ({name}{jack}) -> {:x?}", path);
         outputs.push(name);
     }
+    // Inputs: microphone and line-in pins that an ADC can reach.
+    let adcs: Vec<u32> = codec.widgets.iter().filter(|(_, w)| w.kind == W_INPUT).map(|(n, _)| *n).collect();
+    let pins: Vec<u32> = codec.widgets.iter().filter(|(_, w)| w.kind == W_PIN).map(|(n, _)| *n).collect();
+    // Whether the firmware describes a microphone in a jack (a built-in one does not count).
+    let mut described_jack_mic = false;
+    for &nid in &pins {
+        let config = codec.hda.cmd(addr, nid, GET_CONFIG, 0).unwrap_or(0);
+        described_jack_mic |= matches!(config >> 30, 0 | 3) && (config >> 20) & 0xF == 0xA;
+    }
+    for nid in pins {
+        let pin_caps = codec.hda.param(addr, nid, P_PIN_CAPS);
+        let mut config = codec.hda.cmd(addr, nid, GET_CONFIG, 0).unwrap_or(0);
+        // Some firmwares (the BRIX, the Dell Latitude 7410) describe only the headphone pin of a
+        // Realtek combo jack and mark its microphone "not connected". Realtek codecs wire the headset
+        // microphone to pin 0x19: use it as a jack microphone when no jack microphone is described.
+        if vendor >> 16 == 0x10EC && nid == 0x19 && config >> 30 == 1 && !described_jack_mic && codec.hda.pins.iter().any(|p| p.device == 2) {
+            config = 0x0000_0000 | 0xA << 20;
+        }
+        let (connectivity, device) = (config >> 30, (config >> 20) & 0xF);
+        if pin_caps & 1 << 5 == 0 || connectivity == 1 || !matches!(device, 0x8 | 0xA) {
+            continue;
+        }
+        let Some(path) = adcs.iter().find_map(|&adc| codec.path_from(adc, nid, 5)) else { continue };
+        // Microphone bias: 80 % if the pin offers it, otherwise 50 %.
+        let vref = if device != 0xA {
+            0
+        } else if pin_caps & 1 << 12 != 0 {
+            4
+        } else if pin_caps & 1 << 9 != 0 {
+            1
+        } else {
+            0
+        };
+        let route = codec.input_route(&path, vref);
+        let jack = connectivity != 2 && pin_caps & 1 << 2 != 0;
+        let name = match (device, connectivity) {
+            (0x8, _) => "Line in",
+            (_, 2) => "Internal microphone",
+            _ => "Headset microphone",
+        };
+        kprintln!("audio: codec {addr} pin {nid:#x} ({name}{}) <- {:x?}", if jack { ", jack detect" } else { "" }, path);
+        codec.hda.inputs.push(InPin { codec: addr, nid, adc: path[0], name, jack, trigger: pin_caps & 1 << 1 != 0, route });
+    }
     if outputs.is_empty() {
         return None;
     }
@@ -427,6 +588,14 @@ pub fn probe(devices: &[pci::Device]) -> Option<(Hda, String)> {
     let base = dev.mmio(0, 0x4000);
     let mut hda = Hda {
         pins: Vec::new(),
+        inputs: Vec::new(),
+        mic: None,
+        mic_checked: 0,
+        cap_sd: 0,
+        cap_bdl: dma(CAPTURE_BUFS * 16) as *mut Bdle,
+        cap_buf: dma(CAPTURE_BUFS * CAPTURE_BYTES),
+        cap_read: 0,
+        cap_running: false,
         headphones: false,
         jack_checked: 0,
         base,
@@ -443,6 +612,9 @@ pub fn probe(devices: &[pci::Device]) -> Option<(Hda, String)> {
         return None;
     }
     hda.sd = base + 0x80 + iss as usize * 0x20;
+    if iss > 0 {
+        hda.cap_sd = base + 0x80;
+    }
     let Some(codecs) = hda.reset() else {
         kprintln!("audio: HDA controller does not come out of reset");
         return None;
@@ -473,6 +645,7 @@ pub fn probe(devices: &[pci::Device]) -> Option<(Hda, String)> {
         }
         super::OUTPUT.store(if hp { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
     }
+    hda.update_mic();
     Some((hda, name))
 }
 
@@ -491,17 +664,126 @@ impl Hda {
     }
 
     fn stream_reset(&self) {
-        let ctl = self.sd_r32(SD_CTL) & !0b10;
-        self.sd_w32(SD_CTL, ctl);
-        until(10, || self.sd_r32(SD_CTL) & 0b10 == 0);
-        self.sd_w32(SD_CTL, ctl | 1);
-        until(10, || self.sd_r32(SD_CTL) & 1 != 0);
-        self.sd_w32(SD_CTL, ctl & !1);
-        until(10, || self.sd_r32(SD_CTL) & 1 == 0);
+        reset_stream(self.sd);
     }
 }
 
+/// The register at offset `r` of the stream block `sd`.
+fn sd_reg(sd: usize, r: usize) -> *mut u32 {
+    (sd + r) as *mut u32
+}
+
+/// Stops a stream and puts it through reset (its registers return to the defaults).
+fn reset_stream(sd: usize) {
+    let rd = || unsafe { sd_reg(sd, SD_CTL).read_volatile() };
+    let wr = |v: u32| unsafe { sd_reg(sd, SD_CTL).write_volatile(v) };
+    let ctl = rd() & !0b10;
+    wr(ctl);
+    until(10, || rd() & 0b10 == 0);
+    wr(ctl | 1);
+    until(10, || rd() & 1 != 0);
+    wr(ctl & !1);
+    until(10, || rd() & 1 == 0);
+}
+
 impl Hda {
+    /// Whether a plug is in jack `nid` (a pin with presence detect).
+    fn sensed(&mut self, codec: u32, nid: u32, trigger: bool) -> bool {
+        if trigger {
+            let _ = self.cmd(codec, nid, EXEC_PIN_SENSE, 0);
+            wait(1);
+        }
+        self.cmd(codec, nid, GET_PIN_SENSE, 0).is_some_and(|v| v & 1 << 31 != 0)
+    }
+
+    /// The input to record from: a plugged-in jack first, then a built-in microphone, then
+    /// an input whose plug cannot be sensed.
+    fn pick_mic(&mut self) -> Option<usize> {
+        let jacks: Vec<(usize, u32, u32, bool)> =
+            self.inputs.iter().enumerate().filter(|(_, p)| p.jack).map(|(i, p)| (i, p.codec, p.nid, p.trigger)).collect();
+        for (i, codec, nid, trigger) in jacks {
+            if self.sensed(codec, nid, trigger) {
+                return Some(i);
+            }
+        }
+        self.inputs.iter().position(|p| p.name == "Internal microphone").or_else(|| self.inputs.iter().position(|p| !p.jack))
+    }
+
+    /// Follows the microphone jack: switches the routing and shows the system the right input.
+    fn update_mic(&mut self) {
+        let want = self.pick_mic();
+        if want == self.mic.as_ref().map(|m| m.0) {
+            return;
+        }
+        let running = self.cap_running;
+        if running {
+            self.capture_stop();
+        }
+        if let Some((old, input)) = self.mic.take() {
+            super::remove_input(&input);
+            let (codec, nid, adc) = (self.inputs[old].codec, self.inputs[old].nid, self.inputs[old].adc);
+            let _ = self.cmd(codec, nid, SET_PIN_CTL, 0);
+            let _ = self.cmd(codec, adc, SET_STREAM, 0);
+        }
+        let Some(i) = want else { return };
+        let (codec, route) = (self.inputs[i].codec, self.inputs[i].route.clone());
+        for (nid, verb, payload) in route {
+            let _ = self.cmd(codec, nid, verb, payload);
+        }
+        let input = super::add_input(self.inputs[i].name, RATE);
+        self.mic = Some((i, input));
+        if running {
+            self.capture_start();
+        }
+    }
+
+    fn capture_start(&mut self) {
+        let sd = self.cap_sd;
+        reset_stream(sd);
+        for i in 0..CAPTURE_BUFS {
+            let addr = self.cap_buf as u64 + (i * CAPTURE_BYTES) as u64;
+            unsafe { self.cap_bdl.add(i).write_volatile(Bdle { addr, len: CAPTURE_BYTES as u32, flags: 0 }) };
+        }
+        let bdl = self.cap_bdl as u64;
+        unsafe {
+            sd_reg(sd, SD_BDPL).write_volatile(bdl as u32);
+            sd_reg(sd, SD_BDPU).write_volatile((bdl >> 32) as u32);
+            sd_reg(sd, SD_CBL).write_volatile((CAPTURE_BUFS * CAPTURE_BYTES) as u32);
+            ((sd + SD_LVI) as *mut u16).write_volatile((CAPTURE_BUFS - 1) as u16);
+            ((sd + SD_FMT) as *mut u16).write_volatile(FORMAT);
+            ((sd + SD_STS) as *mut u8).write_volatile(0x1C);
+            let ctl = sd_reg(sd, SD_CTL).read_volatile() & !(0xF << 20);
+            sd_reg(sd, SD_CTL).write_volatile(ctl | CAPTURE_TAG << 20 | 0b10);
+        }
+        self.cap_read = 0;
+        self.cap_running = true;
+    }
+
+    fn capture_stop(&mut self) {
+        unsafe {
+            let ctl = sd_reg(self.cap_sd, SD_CTL).read_volatile();
+            sd_reg(self.cap_sd, SD_CTL).write_volatile(ctl & !0b10);
+        }
+        self.cap_running = false;
+    }
+
+    /// Moves what the ADC has written since the last call to the system's input (stereo → mono).
+    fn capture_read(&mut self) {
+        let Some((_, input)) = &self.mic else { return };
+        let size = CAPTURE_BUFS * CAPTURE_BYTES;
+        let pos = unsafe { sd_reg(self.cap_sd, SD_LPIB).read_volatile() } as usize % size;
+        let end = (pos + size - CAPTURE_GUARD) % size & !3;
+        let mut mono = Vec::new();
+        while self.cap_read != end {
+            let frame = unsafe { (self.cap_buf.add(self.cap_read) as *const [i16; 2]).read_volatile() };
+            mono.push(((frame[0] as i32 + frame[1] as i32) / 2) as i16);
+            self.cap_read = (self.cap_read + 4) % size;
+        }
+        if !mono.is_empty() {
+            input.lock().push(&mono);
+        }
+    }
+
     /// Whether a plug is inserted into at least one headphone jack.
     fn headphones_present(&mut self) -> bool {
         let jacks: Vec<(u32, u32, bool)> =
@@ -577,5 +859,25 @@ impl Hw for Hda {
 
     fn underrun(&mut self) -> bool {
         false
+    }
+
+    fn capture(&mut self, recording: bool) {
+        if self.inputs.is_empty() || self.cap_sd == 0 {
+            return;
+        }
+        let now = interrupts::ticks();
+        if now >= self.mic_checked + HZ / 2 {
+            self.mic_checked = now;
+            self.update_mic();
+        }
+        let recording = recording && self.mic.is_some();
+        if recording && !self.cap_running {
+            self.capture_start();
+        } else if !recording && self.cap_running {
+            self.capture_stop();
+        }
+        if self.cap_running {
+            self.capture_read();
+        }
     }
 }

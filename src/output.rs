@@ -398,7 +398,7 @@ impl Screens {
                 continue;
             }
             let gpu = accel.filter(|_| screen.bgr).and_then(|a| {
-                let dst = crate::baytrail::graphics_address(screen.base as usize)?;
+                let dst = crate::gpu::graphics_address(screen.base as usize)?;
                 let src = a.import(scene.px.as_ptr() as usize, scene.px.len() * 4)?;
                 let dst = crate::accel::Surface { addr: dst, pitch: screen.stride as u32 * 4 };
                 let src = crate::accel::Surface { addr: src, pitch: scene.pw as u32 * 4 };

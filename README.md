@@ -50,10 +50,11 @@ absolute volume) and headset microphones (HFP + SCO).
 
 **Graphics.** GOP framebuffer everywhere; native mode setting with a hardware cursor on Intel
 Bay Trail; the Bay Trail GPU's blitter and render engine for composition and blur; HDMI on
-Comet Lake laptops; several monitors (extend or mirror), per-screen scaling.
+Comet Lake laptops and their GPU's blitter for frame output; several monitors (extend or mirror), per-screen scaling.
 
 **Input and sound.** PS/2, USB HID, I2C HID precision touchpads with gestures; input languages;
-Intel HDA and AC97, a mixer, MP3/OGG/WAV playback, recording.
+Intel HDA and AC97, a mixer, MP3/OGG/WAV playback, recording from built-in and headset microphones
+(following the jack) and Bluetooth headsets.
 
 **Desktop.** A compositing window manager with frosted glass, dock, top bar, notifications,
 calendar, screenshots with annotation, multiple users with a login screen, per-program file

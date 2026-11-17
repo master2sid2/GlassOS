@@ -19,6 +19,51 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const DEVICES: [u16; 4] = [0x0F30, 0x0F31, 0x0F32, 0x0F33];
+/// Comet Lake GT2 (Gen9.5): the blitter only, through the legacy ring buffer.
+const DEVICES_GEN9: [u16; 8] = [0x9B41, 0x9BC4, 0x9BCA, 0x9BCC, 0x9B21, 0x9BA4, 0x9BAA, 0x9BAC];
+/// Gen9: registers (8 MiB) followed by the GGTT (8 MiB: 1 M 8-byte entries — 4 GiB of GPU addresses).
+const MMIO_SIZE_GEN9: u64 = 16 << 20;
+const GTT_GEN9: usize = 8 << 20;
+/// Gen9 GGTT entry: the page address and "present"; bits 3, 4 and 7 pick a PAT entry. We use entry 3
+/// (PWT and PCD) and program it as write-back through the LLC, which the CPU caches stay coherent with;
+/// entry 0 stays as the firmware left it — the display reads the monitor frame through it.
+const PTE9_PRESENT: u64 = 1;
+const PTE9_PAT3: u64 = 1 << 3 | 1 << 4;
+const PAT_LOW: usize = 0x40E0;
+const PAT_WB_LLC: u32 = 0x07;
+// Gen9 forcewake: request and acknowledgement per power domain.
+const FORCEWAKE9: [(usize, usize, &str); 3] = [(0xA278, 0x0D84, "render"), (0xA188, 0x13_0044, "blitter"), (0xA270, 0x0D88, "media")];
+/// The ring runs in legacy mode only while execlists are off (GFX_MODE bit 15).
+const RING_GFX_MODE: usize = 0x29C;
+const GFX_EXECLISTS: u32 = 1 << 15;
+/// The driver runs a Gen9 GPU (set once at startup).
+static GEN9: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The aperture (BAR 2) of a Gen9 GPU: its offset is the GGTT address (for frames the display shows).
+static APERTURE: IrqLock<(usize, usize)> = IrqLock::new((0, 0));
+
+fn gen9() -> bool {
+    GEN9.load(Ordering::Relaxed)
+}
+
+/// Writes GTT entry `index` for physical page `phys` (with CPU cache snooping on Gen7).
+fn set_pte(mmio: usize, index: usize, phys: u64, snooped: bool) {
+    if gen9() {
+        let pte = phys & 0x7F_FFFF_F000 | PTE9_PAT3 | PTE9_PRESENT;
+        unsafe { ((mmio + GTT_GEN9) as *mut u64).add(index).write_volatile(pte) };
+    } else {
+        let pte = phys as u32 & 0xFFFF_F000 | (phys >> 28) as u32 & 0xFF0 | if snooped { PTE_SNOOPED } else { 0 } | PTE_WRITABLE | PTE_VALID;
+        unsafe { ((mmio + GTT) as *mut u32).add(index).write_volatile(pte) };
+    }
+}
+
+/// The GPU address of a CPU address in the aperture (a frame the display shows), if the GPU sees it.
+pub fn graphics_address(cpu: usize) -> Option<u32> {
+    if gen9() {
+        let (base, size) = *APERTURE.lock();
+        return (base != 0 && cpu >= base && cpu < base + size).then(|| (cpu - base) as u32);
+    }
+    crate::baytrail::graphics_address(cpu)
+}
 /// Registers (2 MiB) followed by the GTT (2 MiB: 512 K entries — 2 GiB of GPU addresses).
 const MMIO_SIZE: u64 = 4 << 20;
 const GTT: usize = 2 << 20;
@@ -145,6 +190,15 @@ fn wait(mmio: usize, reg: usize, mask: u32, value: u32) -> bool {
 
 /// Wakes the GPU (both wells) and keeps it awake while we use it.
 fn wake(mmio: usize) -> Result<(), String> {
+    if gen9() {
+        for (reg, ack, name) in FORCEWAKE9 {
+            wr(mmio, reg, masked(FORCEWAKE_KERNEL, true));
+            if !wait(mmio, ack, FORCEWAKE_KERNEL, FORCEWAKE_KERNEL) {
+                return Err(format!("the {name} part of the GPU does not wake up (ack {:#x})", rd(mmio, ack)));
+            }
+        }
+        return Ok(());
+    }
     for (reg, ack, name) in [(FORCEWAKE_RENDER, FORCEWAKE_RENDER_ACK, "render"), (FORCEWAKE_MEDIA, FORCEWAKE_MEDIA_ACK, "media")] {
         wr(mmio, reg, masked(FORCEWAKE_KERNEL, true));
         if !wait(mmio, ack, FORCEWAKE_KERNEL, FORCEWAKE_KERNEL) {
@@ -166,11 +220,9 @@ fn map(mmio: usize, addr: usize, size: usize) -> Option<u32> {
         *next += pages * PAGE;
         at
     };
-    let table = (mmio + GTT) as *mut u32;
     for p in 0..pages {
         let phys = (addr & !(PAGE - 1)) as u64 + (p * PAGE) as u64;
-        let pte = phys as u32 & 0xFFFF_F000 | (phys >> 28) as u32 & 0xFF0 | PTE_SNOOPED | PTE_WRITABLE | PTE_VALID;
-        unsafe { table.add(at / PAGE + p).write_volatile(pte) };
+        set_pte(mmio, at / PAGE + p, phys, true);
     }
     wr(mmio, GTT_FLUSH, 1);
     let _ = rd(mmio, GTT_FLUSH);
@@ -204,6 +256,9 @@ impl Ring {
         let ring_gpu = map(mmio, ring as usize, RING_BYTES).ok_or("no room in the GTT")?;
         let b = base;
         let name = if base == RCS { "render" } else { "blitter" };
+        if gen9() && rd(mmio, b + RING_GFX_MODE) & GFX_EXECLISTS != 0 {
+            return Err(format!("the {name} runs in execlist mode, the legacy ring is off"));
+        }
         wr(mmio, b + RING_MI_MODE, masked(MI_STOP_RING, false));
         wr(mmio, b + RING_CTL, 0);
         wr(mmio, b + RING_HEAD, 0);
@@ -275,8 +330,14 @@ impl Ring {
             let cmds = [PIPE_CONTROL, PC_CS_STALL | PC_STALL_AT_SCOREBOARD, 0, 0, PIPE_CONTROL, flush, self.fence_gpu, self.seqno];
             self.submit(&cmds)?;
         } else {
-            let cmds = [MI_FLUSH_DW | MI_FLUSH_DW_STORE_DWORD, self.fence_gpu | MI_FLUSH_DW_USE_GTT, self.seqno, MI_NOOP];
-            self.submit(&cmds)?;
+            if gen9() {
+                // Gen8+: a 64-bit address, one dword longer.
+                let cmds = [(MI_FLUSH_DW + 1) | MI_FLUSH_DW_STORE_DWORD, self.fence_gpu | MI_FLUSH_DW_USE_GTT, 0, self.seqno];
+                self.submit(&cmds)?;
+            } else {
+                let cmds = [MI_FLUSH_DW | MI_FLUSH_DW_STORE_DWORD, self.fence_gpu | MI_FLUSH_DW_USE_GTT, self.seqno, MI_NOOP];
+                self.submit(&cmds)?;
+            }
         }
         Ok(self.seqno)
     }
@@ -345,13 +406,33 @@ impl Ring {
     }
 }
 
-fn fill_cmds(dst: Surface, x: u32, y: u32, w: u32, h: u32, color: u32) -> [u32; 6] {
-    [XY_COLOR_BLT, BLT_32BPP | ROP_PATCOPY | dst.pitch, y << 16 | x, (y + h) << 16 | (x + w), dst.addr, color]
+/// Gen8+ blitter commands carry 64-bit addresses (an upper dword after each address).
+fn fill_cmds(dst: Surface, x: u32, y: u32, w: u32, h: u32, color: u32) -> Vec<u32> {
+    if gen9() {
+        alloc::vec![XY_COLOR_BLT + 1, BLT_32BPP | ROP_PATCOPY | dst.pitch, y << 16 | x, (y + h) << 16 | (x + w), dst.addr, 0, color]
+    } else {
+        alloc::vec![XY_COLOR_BLT, BLT_32BPP | ROP_PATCOPY | dst.pitch, y << 16 | x, (y + h) << 16 | (x + w), dst.addr, color]
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_cmds(dst: Surface, dx: u32, dy: u32, src: Surface, sx: u32, sy: u32, w: u32, h: u32) -> [u32; 8] {
-    [XY_SRC_COPY_BLT, BLT_32BPP | ROP_SRCCOPY | dst.pitch, dy << 16 | dx, (dy + h) << 16 | (dx + w), dst.addr, sy << 16 | sx, src.pitch, src.addr]
+fn copy_cmds(dst: Surface, dx: u32, dy: u32, src: Surface, sx: u32, sy: u32, w: u32, h: u32) -> Vec<u32> {
+    if gen9() {
+        alloc::vec![
+            XY_SRC_COPY_BLT + 2,
+            BLT_32BPP | ROP_SRCCOPY | dst.pitch,
+            dy << 16 | dx,
+            (dy + h) << 16 | (dx + w),
+            dst.addr,
+            0,
+            sy << 16 | sx,
+            src.pitch,
+            src.addr,
+            0,
+        ]
+    } else {
+        alloc::vec![XY_SRC_COPY_BLT, BLT_32BPP | ROP_SRCCOPY | dst.pitch, dy << 16 | dx, (dy + h) << 16 | (dx + w), dst.addr, sy << 16 | sx, src.pitch, src.addr]
+    }
 }
 
 /// Coordinates and the line stride in blitter commands are signed 16-bit.
@@ -426,11 +507,8 @@ fn import(addr: usize, bytes: usize) -> Option<u32> {
         *imports = (IMPORT_BASE, Vec::new());
     }
     let at = imports.0;
-    let table = (mmio + GTT) as *mut u32;
     for p in 0..pages {
-        let phys = (first + p * PAGE) as u64;
-        let pte = phys as u32 & 0xFFFF_F000 | (phys >> 28) as u32 & 0xFF0 | PTE_SNOOPED | PTE_WRITABLE | PTE_VALID;
-        unsafe { table.add(at / PAGE + p).write_volatile(pte) };
+        set_pte(mmio, at / PAGE + p, (first + p * PAGE) as u64, true);
     }
     wr(mmio, GTT_FLUSH, 1);
     let _ = rd(mmio, GTT_FLUSH);
@@ -611,7 +689,7 @@ static GEN7: Gen7 = Gen7;
 
 impl Accel for Gen7 {
     fn name(&self) -> &'static str {
-        "Intel Gen7 (blitter and render engine)"
+        if gen9() { "Intel Gen9 (blitter)" } else { "Intel Gen7 (blitter and render engine)" }
     }
 
     fn import(&self, addr: usize, bytes: usize) -> Option<u32> {
@@ -663,12 +741,18 @@ impl Accel for Gen7 {
         if !fits(dst, dx, dy, w, h) || !fits(src, sx, sy, w, h) {
             return false;
         }
+        if gen9() {
+            busy();
+        }
         BLITTER.lock().as_mut().is_some_and(|b| b.submit(&copy_cmds(dst, dx, dy, src, sx, sy, w, h)).is_ok())
     }
 
     fn fill(&self, dst: Surface, x: u32, y: u32, w: u32, h: u32, color: u32) -> bool {
         if !fits(dst, x, y, w, h) {
             return false;
+        }
+        if gen9() {
+            busy();
         }
         BLITTER.lock().as_mut().is_some_and(|b| b.submit(&fill_cmds(dst, x, y, w, h, color)).is_ok())
     }
@@ -680,6 +764,20 @@ impl Accel for Gen7 {
     fn done(&self, fence: Fence) -> bool {
         passed(&FENCE_AT, fence)
     }
+}
+
+/// Hands frame output (and the other accelerated work) to the GPU or back to the CPU.
+/// false — there is no working blitter to hand it to.
+pub fn set_output(on: bool) -> bool {
+    if !on {
+        crate::accel::drop_active("switched off with `gpu off`");
+        return true;
+    }
+    if BLITTER.lock().is_none() {
+        return false;
+    }
+    crate::accel::register(&GEN7);
+    true
 }
 
 /// What is up with the GPU — for the report and the log.
@@ -696,7 +794,8 @@ pub fn about() -> Vec<(&'static str, String)> {
     if device == 0 {
         return alloc::vec![("Graphics", "UEFI frame buffer (no GPU driver for this card)".into())];
     }
-    let mut rows = alloc::vec![("Graphics", format!("Intel HD Graphics, Bay Trail (Gen7), PCI 8086:{device:04X}"))];
+    let model = if gen9() { "Intel UHD Graphics, Comet Lake (Gen9.5)" } else { "Intel HD Graphics, Bay Trail (Gen7)" };
+    let mut rows = alloc::vec![("Graphics", format!("{model}, PCI 8086:{device:04X}"))];
     let render = BLURRER.lock().is_some();
     let last = state();
     let engines = match (crate::accel::get().is_some(), render) {
@@ -732,6 +831,9 @@ fn note(text: String) {
 
 /// Brings up the blitter and tests it (in the background, after boot).
 pub fn start(devices: &[pci::Device]) {
+    if let Some(dev) = devices.iter().find(|d| d.vendor == 0x8086 && DEVICES_GEN9.contains(&d.device)).copied() {
+        return start_gen9(dev);
+    }
     let Some(dev) = devices.iter().find(|d| d.vendor == 0x8086 && DEVICES.contains(&d.device)).copied() else { return };
     DEVICE.store(dev.device as u32, Ordering::Relaxed);
     crate::task::spawn("gpu-check", None, move || {
@@ -780,6 +882,69 @@ pub fn start(devices: &[pci::Device]) {
     });
 }
 
+/// Gen9: the blitter through the legacy ring buffer (no execlists, no render engine yet).
+fn start_gen9(dev: pci::Device) {
+    DEVICE.store(dev.device as u32, Ordering::Relaxed);
+    GEN9.store(true, Ordering::Relaxed);
+    crate::task::spawn("gpu-check", None, move || {
+        crate::task::sleep_until(crate::interrupts::ticks() + 25 * crate::interrupts::HZ);
+        dev.enable_bus_master();
+        let mmio = dev.mmio(0, MMIO_SIZE_GEN9);
+        crate::kprintln!(
+            "gpu: Gen9 {:04x}: GGC {:#x}, PAT {:#010x} {:#010x}, BCS gfx_mode {:#x} mi_mode {:#x}",
+            dev.device,
+            dev.read(0x50),
+            rd(mmio, PAT_LOW),
+            rd(mmio, PAT_LOW + 4),
+            rd(mmio, BCS + RING_GFX_MODE),
+            rd(mmio, BCS + RING_MI_MODE)
+        );
+        if let Err(e) = wake(mmio) {
+            return note(format!("no GPU engines: {e}"));
+        }
+        // PAT entry 3: write-back through the LLC (see PTE9_PAT3).
+        let pat = rd(mmio, PAT_LOW) & !(0xFF << 24) | PAT_WB_LLC << 24;
+        wr(mmio, PAT_LOW, pat);
+        *APERTURE.lock() = (dev.bar(2) as usize, aperture_size(&dev));
+        MMIO.store(mmio, Ordering::Relaxed);
+        // The GPU stays at its lowest clock unless asked: raise it for the check, as for work.
+        crate::kprintln!("gpu: {}", raise_frequency(mmio));
+        match Ring::new(mmio, BCS) {
+            Ok(b) => {
+                FENCE_AT.store(b.fence as usize, Ordering::Relaxed);
+                *BLITTER.lock() = Some(b);
+                match self_check(mmio) {
+                    Ok(text) => {
+                        note(text);
+                        crate::accel::register(&GEN7);
+                        // Frames in the aperture are written by the blitter; others stay with the CPU.
+                        for (i, f) in crate::output::frames().iter().enumerate() {
+                            let gpu = graphics_address(f.base as usize);
+                            crate::kprintln!("gpu: screen {i} frame {:#x}: {}", f.base as usize, gpu.map_or("CPU output".into(), |a| format!("blitter output, GGTT {a:#x}")));
+                        }
+                    }
+                    Err(e) => {
+                        *BLITTER.lock() = None;
+                        note(format!("the blitter failed its check: {e}"));
+                    }
+                }
+            }
+            Err(e) => note(format!("no blitter: {e}")),
+        }
+        lower_frequency(mmio);
+        idle_watch(mmio);
+    });
+}
+
+/// The aperture (BAR 2) size: as large as the BAR claims, read by writing ones (the GPU is idle here).
+fn aperture_size(dev: &pci::Device) -> usize {
+    let bar = dev.read(0x18);
+    dev.write(0x18, !0);
+    let size = (!(dev.read(0x18) & !0xF)).wrapping_add(1);
+    dev.write(0x18, bar);
+    size as usize
+}
+
 // The Valleyview GPU frequency: frequency codes, Punit and fuse registers —
 // as in the i915 driver (MIT): PUNIT_REG_GPU_FREQ_REQ 0xD4, PUNIT_REG_GPU_FREQ_STS 0xD8,
 // PUNIT_REG_GPU_LFM 0xD3, IOSF_NC_FB_GFX_FREQ_FUSE 0x1C (maximum in bits 10:3).
@@ -789,8 +954,26 @@ const PUNIT_LFM: u32 = 0xD3;
 const NC_FREQ_FUSE: u32 = 0x1C;
 const FREQ_BUSY: u32 = 1;
 
+// Gen9 frequency: RP_STATE_CAP gives the limits in 50 MHz units (RP0 bits 7:0, RPn bits 23:16),
+// requests (RPNSWREQ bits 31:23) and the actual frequency (RPSTAT1 bits 31:23) are in 16.66 MHz units.
+const GEN9_RP_STATE_CAP: usize = 0x14_5998;
+const GEN9_RPNSWREQ: usize = 0xA008;
+const GEN9_RPSTAT1: usize = 0xA01C;
+
+/// Gen9: requests frequency `units` (16.66 MHz each).
+fn gen9_frequency(mmio: usize, units: u32) {
+    wr(mmio, GEN9_RPNSWREQ, units << 23);
+}
+
 /// Requests the highest GPU frequency from the power unit; the result as a line for the log.
 fn raise_frequency(mmio: usize) -> String {
+    if gen9() {
+        let cap = rd(mmio, GEN9_RP_STATE_CAP);
+        let (max, min) = ((cap & 0xFF) * 3, (cap >> 16 & 0xFF) * 3);
+        gen9_frequency(mmio, max);
+        let now = rd(mmio, GEN9_RPSTAT1) >> 23;
+        return format!("frequency {} → {} MHz (range {}..{} MHz)", now * 50 / 3, max * 50 / 3, min * 50 / 3, max * 50 / 3);
+    }
     use crate::baytrail::{nc_read, punit_read, punit_write};
     let (Some(sts), Some(lfm), Some(fuse)) = (punit_read(mmio, PUNIT_FREQ_STS), punit_read(mmio, PUNIT_LFM), nc_read(mmio, NC_FREQ_FUSE)) else {
         return "frequency: the power unit does not answer".into();
@@ -818,6 +1001,9 @@ fn raise_frequency(mmio: usize) -> String {
 
 /// Returns the GPU to the lowest frequency.
 fn lower_frequency(mmio: usize) {
+    if gen9() {
+        return gen9_frequency(mmio, (rd(mmio, GEN9_RP_STATE_CAP) >> 16 & 0xFF) * 3);
+    }
     use crate::baytrail::{punit_read, punit_write};
     if let Some(lfm) = punit_read(mmio, PUNIT_LFM) {
         punit_write(mmio, PUNIT_FREQ_REQ, (lfm & 0xFF).max(0xC0));

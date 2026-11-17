@@ -99,7 +99,7 @@ const COMMANDS: [(&str, &str, &str); 72] = [
     ("System", "lid", "lid [open|closed|auto] \u{2014} show the laptop lid; act as if it moved, auto listens to the sensor again"),
     ("System", "display", "display [WIDTHxHEIGHT[@HZ]|keep|revert|off] \u{2014} screen modes, off = blank now; a new mode shows at once and goes back by itself unless kept"),
     ("System", "pci", "pci [BUS:DEV.FN [read BAR OFFSET [COUNT] | write BAR OFFSET VALUE]] \u{2014} PCI devices, one's configuration, its registers in hex (administrator)"),
-    ("System", "gpu", "gpu [blur on|off | read OFFSET [COUNT] | write OFFSET VALUE | dpio REG [VALUE]] \u{2014} the GPU engines; blur on/off: glass by the GPU or the CPU; Bay Trail display registers in hex, for debugging (administrator)"),
+    ("System", "gpu", "gpu [on|off | blur on|off | read OFFSET [COUNT] | write OFFSET VALUE | dpio REG [VALUE]] \u{2014} the GPU engines; on/off: frame output by the GPU or the CPU; blur on/off: glass by the GPU or the CPU; Bay Trail display registers in hex, for debugging (administrator)"),
     ("System", "remote", "remote [on|off|key|newkey|keep] \u{2014} remote access over the network: status, turn it on or off, show or change the key; keep makes the running trial kernel the main one"),
     ("System", "power", "power [light|deep|wm on|wm off] \u{2014} temperature, speed, watts; how deeply the processor sleeps; wm lets memory sleep behind the monitor"),
     ("System", "screenshot", "screenshot \u{2014} choose an area of the screen"),
@@ -551,7 +551,7 @@ impl Shell {
 
     /// `gpu`: Bay Trail display registers for debugging (including over the network). Numbers are in hex.
     fn gpu(&mut self, arg: &str) {
-        const USAGE: &str = "usage: gpu [read OFFSET [COUNT] | write OFFSET VALUE | dpio REG [VALUE]]";
+        const USAGE: &str = "usage: gpu [on|off | read OFFSET [COUNT] | write OFFSET VALUE | dpio REG [VALUE]]";
         if let Some(n) = arg.strip_prefix("blur offset ").and_then(|n| n.trim().parse::<u32>().ok()) {
             crate::gpu::set_blur_offset(n);
             crate::wm::repaint_all();
@@ -562,6 +562,16 @@ impl Shell {
             crate::gpu::set_blur(how == "on");
             crate::wm::repaint_all();
             self.print(if how == "on" { "gpu: the glass is blurred by the GPU" } else { "gpu: the glass is blurred by the CPU" });
+            return;
+        }
+        if arg == "off" || arg == "on" {
+            let on = arg == "on";
+            self.print(if crate::gpu::set_output(on) {
+                if on { "gpu: the GPU copies frames to the screen" } else { "gpu: the CPU copies frames to the screen" }
+            } else {
+                "gpu: no working GPU engine"
+            });
+            crate::wm::repaint_all();
             return;
         }
         if arg.is_empty() {

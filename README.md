@@ -72,6 +72,12 @@ a sound recorder, and Lua programs such as a music player.
 Other UEFI PCs usually boot to the desktop with the firmware's framebuffer; drivers are a matter of
 luck. Please send a [hardware report](CONTRIBUTING.md#hardware-reports) for your machine.
 
+## Trying it
+
+Download `glassos.img` (USB stick) or `glassos.iso` (Ventoy, VMs) from
+[Releases](https://github.com/master2sid2/GlassOS/releases), write it to a USB stick and boot it in
+UEFI mode with Secure Boot off. Details in [CONTRIBUTING.md](CONTRIBUTING.md#hardware-reports).
+
 ## Building and running
 
 You need Linux with Rust nightly (`rust-toolchain.toml` selects it, with `rust-src`),

@@ -28,7 +28,7 @@ its SATA disk and updated over the network with trial kernels.
 | Wi-Fi | Realtek RTL8723BE | ⚠️ | WPA2-PSK, reconnects after a drop, group key renewal; ~1.5 MB/s upload with a fixed rate. The firmware gives the card no PCI address (the driver assigns one). Its receive DMA can hang until a full power-off |
 | Bluetooth | Realtek RTL8723B (USB, same card) | ✅ | Keyboards and mice (LE, HID over GATT), headphones (A2DP, buttons, absolute volume), headset microphone (HFP). Heavy Wi-Fi traffic can disturb audio |
 | USB | xHCI | ✅ | Keyboards, mice, sticks, hubs, USB Ethernet |
-| Sound | Intel HDA | ❔ | |
+| Sound | Intel HDA | ⚠️ | Headphone jack works. A microphone on the jack is not used: recording only supports Bluetooth headsets so far |
 | Watchdog | TCO | ✅ | Resets the board 30–60 s after a hard hang |
 | Power | | ⚠️ | Deep C-states and sensors work; no sleep/hibernate |
 
@@ -48,7 +48,7 @@ Laptop, Intel Comet Lake. Runs as a live system from a USB stick (its NVMe disk 
 | Wi-Fi | Intel Wi-Fi 6 AX201 | ⚠️ | Experimental driver; copying over Wi-Fi measured at 8–10 MB/s |
 | Bluetooth | Intel AX201 (USB 8087:0026) | ⚠️ | Firmware loads, keyboards pair; key auto-repeat may stick while Wi-Fi is busy |
 | Battery, lid | Embedded controller | ✅ | Charge, time left, lid closes the screen |
-| Sound | Intel HDA | ✅ | Built-in speakers; headphone jack and microphone not verified |
+| Sound | Intel HDA | ⚠️ | Speakers and headphone jack work. A microphone on the jack is not used: recording only supports Bluetooth headsets so far |
 | Power | | ⚠️ | No sleep/hibernate; deep C-states not verified |
 
 ## QEMU/KVM

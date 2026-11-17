@@ -16,6 +16,8 @@
   negotiation.
 - **MSI** is used by USB (xHCI), RTL8168 and RTL8723BE; HDA sound, Intel Wi-Fi and e1000 are polled.
 - **Sleep and hibernation** are not implemented (closing the lid only turns off the screen).
+- **Sound recording** only works from Bluetooth headsets: the microphone input of HDA sound cards
+  (the headset jack, built-in microphones) is not used yet.
 - **Touchpads** are polled; there are no settings for speed or scrolling direction, no three-finger
   gestures, no horizontal scrolling.
 

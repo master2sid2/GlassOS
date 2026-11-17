@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/logo.png" alt="GlassOS logo" width="160"></p>
+![GlassOS — an operating system written from scratch by an AI](docs/images/social-preview.png)
 
 # GlassOS
 

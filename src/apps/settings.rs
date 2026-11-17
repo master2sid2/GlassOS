@@ -772,7 +772,7 @@ impl Settings {
                 rows.push(row("Settings and home folder are kept in", home.into(), Widget::Info));
             }
             Section::About => {
-                rows.push(row(crate::wm::OS_NAME, "version 0.2".into(), Widget::Info));
+                rows.push(row(crate::wm::OS_NAME, concat!("version ", crate::os_version!()).into(), Widget::Info));
                 // USB mice and keyboards — as they are now (they get plugged and unplugged).
                 let usb = crate::usb::list();
                 let usb_of = |what: &str| -> Vec<String> {

@@ -1548,7 +1548,7 @@ Native programs live in /bin and run in user mode (ring 3), each in its
 own address space: try `ring3`, `count 5`, `cat readme.txt` or `crash`.
 ";
 
-pub const OS_VERSION: &str = "GlassOS 0.2 x86_64 (UEFI)\n";
+pub const OS_VERSION: &str = concat!("GlassOS ", crate::os_version!(), " x86_64 (UEFI)\n");
 
 /// The initial contents for an empty disk.
 pub fn create_defaults() {

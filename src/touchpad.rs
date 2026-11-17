@@ -53,9 +53,13 @@ const RESTORE_EVERY: u64 = HZ * 2;
 /// its state: enable touch mode again.
 const STUCK_LINE: u32 = 50;
 /// While fingers are on the pad, poll this often (the touchpad sends a frame every ~9 ms).
-const ACTIVE_POLL_MS: u64 = 2;
+/// With two fingers the touchpad sends a report every ~2.4 ms (one per finger) and keeps only the
+/// latest: poll the line every quarter of a millisecond (the fast timer's step).
+const ACTIVE_POLLS_PER_MS: u64 = 4;
 /// How long after the last contact to keep polling often.
 const ACTIVE_TAIL: u64 = HZ / 2;
+/// No frame for this long while fingers are down: frames were lost.
+const LOST_AFTER_MS: u64 = 40;
 /// GPIO pin register (DW0): input level and pin mode.
 const PAD_RX_STATE: u32 = 1 << 1;
 const PAD_RX_DISABLED: u32 = 1 << 9;
@@ -178,9 +182,47 @@ pub fn status() -> Vec<String> {
         s.restored,
         crate::input::AUX_RESTARTS.load(core::sync::atomic::Ordering::Relaxed)
     ));
+    out.push(format!(
+        "i2c bus recoveries {}, last failure: {}",
+        crate::i2c::RECOVERIES.load(core::sync::atomic::Ordering::Relaxed),
+        crate::i2c::last_failure()
+    ));
+    out.push(format!(
+        "ps/2 mouse reports {}, packets {}, bytes skipped while I2C talks {}",
+        if crate::input::ps2_pointer_is_off() { "off" } else { "on" },
+        crate::input::PS2_PACKETS.load(core::sync::atomic::Ordering::Relaxed),
+        crate::input::PS2_SKIPPED.load(core::sync::atomic::Ordering::Relaxed)
+    ));
     for r in &s.odd {
         out.push(format!("  {r}"));
     }
+    out
+}
+
+/// The last frames and what they turned into: `touchpad trace`, to see why the cursor moved.
+const TRACE_LEN: usize = 800;
+static TRACE: IrqLock<alloc::collections::VecDeque<String>> = IrqLock::new(alloc::collections::VecDeque::new());
+
+fn trace_push(line: String) {
+    let mut t = TRACE.lock();
+    if t.len() >= TRACE_LEN {
+        t.pop_front();
+    }
+    t.push_back(line);
+}
+
+/// What happened just before the first failed read.
+static FIRST_FAILURE: IrqLock<Vec<String>> = IrqLock::new(Vec::new());
+
+pub fn trace() -> Vec<String> {
+    let mut out = Vec::new();
+    let first = FIRST_FAILURE.lock().clone();
+    if !first.is_empty() {
+        out.push("--- before the first failed read:".into());
+        out.extend(first);
+        out.push("--- the last frames:".into());
+    }
+    out.extend(TRACE.lock().iter().cloned());
     out
 }
 
@@ -203,6 +245,10 @@ pub fn start(devices: &[crate::pci::Device]) {
             set_text("no I2C touchpad".into());
             return;
         };
+        // Dell: the EC reads the touchpad too (for its PS/2 emulation) until told to stop.
+        if crate::battery::touchpad_to_os() {
+            task::sleep_until(interrupts::ticks() + HZ / 20);
+        }
         // Fast mode, if the device answers the same way in it.
         bus.set_fast();
         if i2c::hid_device(&bus, addr).is_none_or(|d| d.vendor != dev.vendor) {
@@ -216,6 +262,7 @@ pub fn start(devices: &[crate::pci::Device]) {
             return set_text(format!("{:04x}:{:04x}: {e}", dev.vendor, dev.product));
         }
         let mouse = hid::mouse(&fields);
+        log_layout(&layout, dev.max_input);
         set_text(format!(
             "{:04x}:{:04x} on {name} at {addr:#04x}, {:.0}x{:.0} mm, {} finger(s) per report",
             dev.vendor,
@@ -226,6 +273,21 @@ pub fn start(devices: &[crate::pci::Device]) {
         ));
         run(&bus, addr, &dev, &layout, mouse.as_ref());
     });
+}
+
+/// Where the touch report's fields lie: a wrong offset or range throws the cursor around.
+fn log_layout(layout: &Layout, max_input: usize) {
+    let f = |name: &str, f: &hid::Field| format!("{name} @{}+{} [{}..{}] e{}", f.offset, f.size, f.logical_min, f.logical_max, f.unit_exponent);
+    let mut parts = alloc::vec![format!("report {}, max input {max_input}", layout.report)];
+    for (i, g) in layout.fingers.iter().enumerate() {
+        parts.push(format!("finger {i}: {}, {}, {}", f("tip", &g.tip), f("x", &g.x), f("y", &g.y)));
+        parts.extend(g.id.map(|id| f("id", &id)));
+        parts.extend(g.confidence.map(|c| f("confidence", &c)));
+    }
+    parts.extend(layout.count.map(|c| f("count", &c)));
+    parts.extend(layout.button.map(|b| f("button", &b)));
+    parts.extend(layout.scan_time.map(|t| f("scan", &t)));
+    kprintln!("touchpad: {}", parts.join("; "));
 }
 
 fn reopen(devices: &[crate::pci::Device], name: &str) -> Option<Bus> {
@@ -392,6 +454,13 @@ fn cycles_per_ms() -> u64 {
 #[derive(Default)]
 struct Touch {
     frames: u32,
+    /// Wall-clock start (TSC) and how many times the loop looked at the line during the contact.
+    wall_start: u64,
+    polls: u32,
+    empties: u32,
+    /// The longest pause between two looks at the line (TSC): how late this thread runs.
+    last_poll: u64,
+    poll_gap: u64,
     missed: u32,
     longest: f32,
     started: f32,
@@ -442,7 +511,7 @@ fn run(bus: &Bus, addr: u8, dev: &HidDevice, layout: &Layout, mouse: Option<&hid
     // that was not read completely.
     let length = dev.max_input.clamp(3 + report_len(layout), 256);
     let per_ms = cycles_per_ms();
-    let nap = per_ms * ACTIVE_POLL_MS;
+    let nap = per_ms / ACTIVE_POLLS_PER_MS;
     // The touchpad releases the line shortly after a read: wait this long before deciding
     // that another report follows this one.
     let release = per_ms * 3 / 10;
@@ -457,16 +526,44 @@ fn run(bus: &Bus, addr: u8, dev: &HidDevice, layout: &Layout, mouse: Option<&hid
     // Buttons held by a mouse report: they must be released when switching to touch.
     let mut mouse_buttons = 0u8;
     let mut active_until = 0;
+    let mut last_frame_at = 0u64;
     loop {
+        if touch.frames > 0 {
+            touch.polls += 1;
+            let now = crate::arch::rdtsc();
+            if touch.last_poll != 0 {
+                touch.poll_gap = touch.poll_gap.max(now - touch.last_poll);
+            }
+            touch.last_poll = now;
+        }
         for _ in 0..DRAIN {
             // The line is not calling — nothing to read (and the touchpad does not hold the bus).
             if line.as_ref().is_some_and(|l| !l.asserted()) {
                 break;
             }
+            let read_at = crate::arch::rdtsc();
             let Some(buf) = bus.transfer(addr, &[], length) else {
                 count(|s| s.failed += 1);
+                trace_push(format!("  {:.1} read failed: {}", read_at as f32 / per_ms as f32, crate::i2c::last_failure()));
+                {
+                    let mut first = FIRST_FAILURE.lock();
+                    if first.is_empty() {
+                        *first = TRACE.lock().iter().cloned().collect();
+                    }
+                }
                 break;
             };
+            {
+                let n = (u16::from_le_bytes([buf[0], buf[1]]) as usize).min(buf.len());
+                let hex: String = buf[..n.max(2)].iter().map(|b| format!("{b:02x}")).collect();
+                let held = line.as_ref().is_some_and(|l| l.asserted());
+                trace_push(format!(
+                    "  {:.1} read {hex} in {} us, line {}",
+                    read_at as f32 / per_ms as f32,
+                    (crate::arch::rdtsc() - read_at) * 1000 / per_ms.max(1),
+                    if held { "still low" } else { "released" }
+                ));
+            }
             if let Some(l) = &line {
                 let end = crate::hwprobe::deadline(release);
                 while l.asserted() && !crate::hwprobe::expired(end) {
@@ -476,6 +573,7 @@ fn run(bus: &Bus, addr: u8, dev: &HidDevice, layout: &Layout, mouse: Option<&hid
             let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
             let report = &buf[..len.min(buf.len())];
             if len <= 3 {
+                touch.empties += 1;
                 // It called but returned nothing: this is how the touchpad reports its reset. If it
                 // repeats, the line is "stuck" — the touchpad lost its state, wake touch mode.
                 if let Some(l) = line.as_mut() {
@@ -527,6 +625,9 @@ fn run(bus: &Bus, addr: u8, dev: &HidDevice, layout: &Layout, mouse: Option<&hid
                 continue;
             }
             active_until = interrupts::ticks() + ACTIVE_TAIL;
+            if !crate::input::ps2_pointer_is_off() {
+                crate::input::ps2_pointer_off(true);
+            }
             if mouse_buttons != 0 {
                 mouse_buttons = 0;
                 crate::input::push([Event::MouseMove { dx: 0, dy: 0, buttons: 0, wheel: 0 }]);
@@ -542,23 +643,51 @@ fn run(bus: &Bus, addr: u8, dev: &HidDevice, layout: &Layout, mouse: Option<&hid
                     }
                 } else {
                     touch.started = frame.time;
+                    touch.wall_start = crate::arch::rdtsc();
                 }
+                // Frames were lost (by the clock, which the scan counter cannot lie about): the finger
+                // may have lifted and landed elsewhere — do not turn that jump into cursor motion.
+                let now = crate::arch::rdtsc();
+                let lost = now - last_frame_at > per_ms * LOST_AFTER_MS;
+                if lost {
+                    gestures.lost();
+                }
+                last_frame_at = now;
                 touch.frames += 1;
                 touch.last = frame.time;
                 if frame.contacts.is_empty() {
                     if touches < LOGGED_TOUCHES {
                         touches += 1;
                         kprintln!(
-                            "touchpad: touch {:.0} ms, {} frames, about {} missed, longest gap {:.0} ms",
+                            "touchpad: touch {:.0} ms by scan time, {} ms by the clock, {} frames, about {} missed, longest gap {:.0} ms, {} polls (longest pause {} us), {} empty reads",
                             touch.last - touch.started,
+                            (crate::arch::rdtsc() - touch.wall_start) / per_ms.max(1),
                             touch.frames,
                             touch.missed,
-                            touch.longest
+                            touch.longest,
+                            touch.polls,
+                            touch.poll_gap * 1000 / per_ms.max(1),
+                            touch.empties
                         );
                     }
                     touch = Touch::default();
                 }
-                for step in gestures.frame(&frame) {
+                let mut line = format!("{:.1}", frame.time);
+                if lost {
+                    line.push_str(" LOST");
+                }
+                for c in &frame.contacts {
+                    line.push_str(&format!(" #{}({:.1},{:.1})", c.id, c.x, c.y));
+                }
+                if frame.button {
+                    line.push_str(" btn");
+                }
+                let steps = gestures.frame(&frame);
+                for st in &steps {
+                    line.push_str(&format!(" -> {},{} b{} w{}", st.dx, st.dy, st.buttons, st.wheel));
+                }
+                trace_push(line);
+                for step in steps {
                     crate::input::push([Event::MouseMove { dx: step.dx, dy: step.dy, buttons: step.buttons, wheel: step.wheel }]);
                 }
             }

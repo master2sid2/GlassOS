@@ -206,23 +206,37 @@ pub fn disks() -> Vec<(u32, u64)> {
     USB.lock().as_ref().map_or(Vec::new(), |u| u.disks.iter().map(|d| (d.id, d.blocks)).collect())
 }
 
+/// The controller is taken for this much at a time: a long file write in one go held it for
+/// seconds (a slow stick), and the keyboard and mouse thread waited behind it.
+const DISK_CHUNK: usize = 64 * 1024;
+
 pub fn disk_read(disk: u32, lba: u32, buf: &mut [u8]) -> bool {
-    let mut guard = USB.lock();
-    let Some(usb) = guard.as_mut() else { return false };
-    let Some(d) = usb.disks.iter_mut().find(|d| d.id == disk) else { return false };
-    let done = d.transfer(&mut usb.hc, lba, buf, false);
-    give_way(guard);
-    done
+    for (k, chunk) in buf.chunks_mut(DISK_CHUNK).enumerate() {
+        let mut guard = USB.lock();
+        let Some(usb) = guard.as_mut() else { return false };
+        let Some(d) = usb.disks.iter_mut().find(|d| d.id == disk) else { return false };
+        let done = d.transfer(&mut usb.hc, lba + (k * DISK_CHUNK / 512) as u32, chunk, false);
+        give_way(guard);
+        if !done {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn disk_write(disk: u32, lba: u32, data: &[u8]) -> bool {
-    let mut guard = USB.lock();
-    let Some(usb) = guard.as_mut() else { return false };
-    let Some(d) = usb.disks.iter_mut().find(|d| d.id == disk) else { return false };
-    let mut copy = data.to_vec();
-    let done = d.transfer(&mut usb.hc, lba, &mut copy, true);
-    give_way(guard);
-    done
+    for (k, chunk) in data.chunks(DISK_CHUNK).enumerate() {
+        let mut copy = chunk.to_vec();
+        let mut guard = USB.lock();
+        let Some(usb) = guard.as_mut() else { return false };
+        let Some(d) = usb.disks.iter_mut().find(|d| d.id == disk) else { return false };
+        let done = d.transfer(&mut usb.hc, lba + (k * DISK_CHUNK / 512) as u32, &mut copy, true);
+        give_way(guard);
+        if !done {
+            return false;
+        }
+    }
+    true
 }
 
 /// Releases the controller and yields: otherwise the next chunk would take it right away, and the

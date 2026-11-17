@@ -3,6 +3,15 @@
 
 extern crate alloc;
 
+/// The system version: the one place to change it (the About window, Settings, /system/version,
+/// `sys.version()` in Lua and the metrics exporter take it from here).
+macro_rules! os_version {
+    () => {
+        "0.3"
+    };
+}
+pub(crate) use os_version;
+
 mod access;
 mod acpi;
 mod ahci;

@@ -28,6 +28,9 @@ const RIGHT_ZONE_X: f32 = 0.55;
 const RIGHT_ZONE_Y: f32 = 0.72;
 /// A jump larger than this in one frame is not motion but a new finger with the same id.
 const MAX_STEP_MM: f32 = 15.0;
+/// After a frame with several fingers, one-finger frames do not move the cursor for this long: a
+/// lost report of the second finger looks like one finger, and scrolling would jerk the cursor.
+const MULTI_SETTLE_MS: f32 = 80.0;
 
 pub const LEFT: u8 = 1;
 pub const RIGHT: u8 = 2;
@@ -67,6 +70,8 @@ pub struct Gestures {
     /// The contact started then, there were up to this many fingers, the travel of the farthest.
     touch_start: Option<f32>,
     max_fingers: usize,
+    /// Until when one-finger frames do not move the cursor (see `MULTI_SETTLE_MS`).
+    multi_until: f32,
     travel: f32,
     starts: Vec<Contact>,
     /// The pad was pressed during this contact: then it is not a tap click.
@@ -91,6 +96,7 @@ impl Gestures {
             last_time: 0.0,
             touch_start: None,
             max_fingers: 0,
+            multi_until: 0.0,
             travel: 0.0,
             starts: Vec::new(),
             pressed_in_touch: false,
@@ -101,6 +107,12 @@ impl Gestures {
             scroll: 0.0,
             sent_buttons: 0,
         }
+    }
+
+    /// Frames were lost: the next frame's contacts are not compared with the last ones (a finger
+    /// may have lifted and touched down elsewhere in between).
+    pub fn lost(&mut self) {
+        self.last.clear();
     }
 
     /// Handles a frame. There may be several steps: a tap click is a press
@@ -151,6 +163,10 @@ impl Gestures {
 
         let mut step = Step { buttons, ..Step::default() };
         let settling = self.held != 0 && f.time - self.pressed_at < PRESS_SETTLE_MS;
+        if fingers >= 2 {
+            self.multi_until = f.time + MULTI_SETTLE_MS;
+        }
+        let after_multi = fingers == 1 && self.held == 0 && f.time < self.multi_until;
         if fingers == 2 && self.held == 0 && moves.len() == 2 {
             // Scrolling: the content follows the fingers, so a finger moving down is the wheel up.
             self.scroll += (moves[0].1 + moves[1].1) / 2.0;
@@ -159,7 +175,7 @@ impl Gestures {
                 self.scroll -= clicks as f32 * SCROLL_STEP;
                 step.wheel = -clicks;
             }
-        } else if !settling && !moves.is_empty() && (fingers == 1 || self.held != 0) {
+        } else if !settling && !after_multi && !moves.is_empty() && (fingers == 1 || self.held != 0) {
             // The cursor follows the finger that moved most (with the pad pressed
             // the second finger usually just rests on the button).
             let (mx, my) = moves.iter().copied().fold((0.0f32, 0.0f32), |best, m| if len(m) > len(best) { m } else { best });

@@ -316,4 +316,4 @@ pub fn render() -> String {
 }
 
 /// The system version for `glassos_info`.
-pub const VERSION: &str = "0.2";
+pub const VERSION: &str = crate::os_version!();

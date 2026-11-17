@@ -63,6 +63,24 @@ pub fn push(events: impl IntoIterator<Item = Event>) {
 /// The touchpad sends reports over I2C: until this tick its PS/2 copy is ignored, otherwise the cursor
 /// would get every movement twice. If I2C goes silent, PS/2 is listened to again.
 pub static PS2_AUX_QUIET_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// PS/2 mouse packets that moved the cursor, and bytes skipped while I2C talked (for `touchpad`).
+/// The I2C touchpad delivers touches: its PS/2 copy is switched off at the device (a short quiet
+/// window is not enough — the copy arrives before the I2C report is read and moves the cursor
+/// twice, and a window ending mid-packet turns the rest of the stream into wild jumps).
+static AUX_OFF_WANTED: AtomicBool = AtomicBool::new(false);
+static AUX_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Asks the input thread to switch PS/2 mouse reports off (`true`) or back on.
+pub fn ps2_pointer_off(off: bool) {
+    AUX_OFF_WANTED.store(off, Ordering::Relaxed);
+}
+
+pub fn ps2_pointer_is_off() -> bool {
+    AUX_OFF.load(Ordering::Relaxed)
+}
+
+pub static PS2_PACKETS: AtomicU64 = AtomicU64::new(0);
+pub static PS2_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// How many key presses came from where (only the count — not which keys): PS/2, the shared queue
 /// (USB, Bluetooth, remote input) and, out of it, USB keyboards. They show who sends
@@ -228,10 +246,22 @@ impl Input {
                 if self.vmmouse {
                     continue;
                 }
-                if now < PS2_AUX_QUIET_UNTIL.load(Ordering::Relaxed) {
+                // A restart ("self-test passed", 0xAA 0x00) still gets through: then PS/2 comes
+                // back on, in case the touchpad left I2C.
+                let restart = self.packet_len == 1 && self.packet[0] == 0xAA && byte == 0x00;
+                if AUX_OFF.load(Ordering::Relaxed) && !restart {
+                    self.packet[0] = byte;
+                    self.packet_len = 1;
+                    PS2_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                } else if AUX_OFF.load(Ordering::Relaxed) {
+                    self.packet_len = 0;
+                    AUX_RESTARTED.store(true, Ordering::Relaxed);
+                    AUX_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                } else if now < PS2_AUX_QUIET_UNTIL.load(Ordering::Relaxed) {
                     // A copy of the contacts: skip it. A button held over PS/2 before
                     // I2C started talking is released, otherwise it would stay held.
                     self.packet_len = 0;
+                    PS2_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     if self.ps2_buttons != 0 {
                         self.ps2_buttons = 0;
                         out.push(Event::Mouse { x: self.mx, y: self.my, buttons: self.usb_buttons, wheel: 0 });
@@ -266,13 +296,27 @@ impl Input {
         }
         if AUX_RESTARTED.swap(false, Ordering::Relaxed) {
             // After a restart the mouse is silent and sends short packets: bring it back.
-            // Interrupts are off meanwhile so the answer does not go to the queue.
+            // Interrupts are off meanwhile so the answer does not go to the queue. The touchpad
+            // may have left I2C: PS/2 stays on until its driver hears touches again.
+            AUX_OFF_WANTED.store(false, Ordering::Relaxed);
+            AUX_OFF.store(false, Ordering::Relaxed);
             crate::sync::without_interrupts(|| {
                 mouse_cmd(0xF4);
             });
             self.mouse_id = 0;
             self.packet_len = 0;
             crate::kprintln!("input: ps/2 mouse restarted, reports enabled again");
+        }
+        let off = AUX_OFF_WANTED.load(Ordering::Relaxed);
+        if off != AUX_OFF.load(Ordering::Relaxed) {
+            let taken = crate::sync::without_interrupts(|| mouse_cmd(if off { 0xF5 } else { 0xF4 }));
+            AUX_OFF.store(off, Ordering::Relaxed);
+            self.packet_len = 0;
+            if off && self.ps2_buttons != 0 {
+                self.ps2_buttons = 0;
+                out.push(Event::Mouse { x: self.mx, y: self.my, buttons: self.usb_buttons, wheel: 0 });
+            }
+            crate::kprintln!("input: ps/2 mouse reports {} (the I2C touchpad {}), {}", if off { "off" } else { "on" }, if off { "talks" } else { "went quiet" }, if taken { "acknowledged" } else { "no acknowledgement" });
         }
         // On every event vmmouse also pokes the PS/2 mouse (IRQ12) — we poll on that.
         if self.vmmouse && (MOUSE_PENDING.swap(false, Ordering::Relaxed) || fallback) && !self.poll_vmmouse(out) {
@@ -438,6 +482,7 @@ impl Input {
         let dy = b2 as i32 - (((b0 as i32) << 3) & 0x100);
         (self.mx, self.my) = crate::output::clamp(self.mx + dx, self.my - dy);
         self.ps2_buttons = b0 & 0x07;
+        PS2_PACKETS.fetch_add(1, Ordering::Relaxed);
         out.push(Event::Mouse { x: self.mx, y: self.my, buttons: self.ps2_buttons | self.usb_buttons, wheel });
     }
 

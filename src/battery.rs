@@ -182,6 +182,22 @@ fn with_ec<T>(profile: &Profile, f: impl Fn(&Ec) -> Option<T>) -> Option<T> {
     None
 }
 
+/// The EC's touchpad switch (the ECTP method in the DSDT writes this byte): while it is on, the EC
+/// itself reads the I2C touchpad on the same bus to emulate a PS/2 mouse, takes reports away
+/// from the I2C driver and collides with it on the bus. The firmware turns it off when the system
+/// calls the touchpad's HID _DSM (the HIDD method), as Windows and Linux do.
+const EC_TOUCHPAD: u8 = 0x20;
+
+/// The I2C touchpad driver takes over: the EC stops reading the touchpad. false — not a known model.
+pub fn touchpad_to_os() -> bool {
+    let Some((oem, table)) = acpi::dsdt_id() else { return false };
+    let Some(profile) = PROFILES.iter().find(|p| oem.starts_with(p.oem) && table.starts_with(p.table)) else { return false };
+    let before = with_ec(profile, |ec| ec.byte(EC_TOUCHPAD));
+    let done = with_ec(profile, |ec| ec.write(EC_TOUCHPAD, 0)).is_some();
+    kprintln!("battery: EC touchpad switch {before:?} -> 0 ({})", if done { "written" } else { "the EC did not answer" });
+    done
+}
+
 /// Starts battery polling if the model is known.
 pub fn start() {
     let Some((oem, table)) = acpi::dsdt_id() else { return };

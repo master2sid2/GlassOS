@@ -167,7 +167,7 @@ pub fn call(lib: &str, name: &str, a: &Args) -> Vec<Value> {
             let name = crate::access::user().unwrap_or_default();
             vec![Value::text(&name), Value::text(&crate::access::home()), Value::Bool(crate::access::is_admin())]
         }
-        ("sys", "version") => vec![Value::text("0.2")],
+        ("sys", "version") => vec![Value::text(crate::os_version!())],
         ("sys", "notify") => {
             wm::notify(a.opt(2).as_deref().unwrap_or("Notification"), &a.text(1));
             Vec::new()

@@ -68,7 +68,7 @@ a sound recorder, and Lua programs such as a music player.
 |---|---|
 | QEMU/KVM, q35 + OVMF | The development VM: everything except real-hardware drivers |
 | GIGABYTE BRIX (Celeron N2807, Bay Trail) | The main test machine: display, SATA, Ethernet, Wi-Fi, Bluetooth, watchdog |
-| Dell Latitude 7410 (Comet Lake) | Live from USB: HDMI, Wi-Fi, Bluetooth, battery; touchpad without gestures |
+| Dell Latitude 7410 (Comet Lake) | Live from USB: HDMI, GPU blitter, Wi-Fi, Bluetooth, battery, touchpad with scrolling |
 
 What works on each machine, part by part, is in [docs/hardware.md](docs/hardware.md). Other UEFI PCs
 usually boot to the desktop with the firmware's framebuffer; drivers are a matter of luck. Please

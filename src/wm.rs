@@ -1383,7 +1383,11 @@ impl Wm {
                 let (w, h, (cw, ch)) = size(SETTINGS_SIZE.0, SETTINGS_SIZE.1);
                 ("settings", "Settings".into(), w, h, Box::new(Settings::new(cw, ch, arg.as_deref(), self.sysinfo.clone())))
             }
-            "about" => ("about", "About".into(), 430, 280, Box::new(About::new(self.sysinfo.clone()))),
+            "about" => {
+                let about = About::new(self.sysinfo.clone());
+                let (aw, ah) = about.size();
+                ("about", "About".into(), aw, ah + TITLE_H, Box::new(about))
+            }
             "viewer" => {
                 let path = arg?;
                 ("viewer", fs::name(&path).into(), 860, 640, Box::new(Viewer::new(path)))

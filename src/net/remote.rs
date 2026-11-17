@@ -765,8 +765,10 @@ fn put_file(head: &Head, body: &[u8]) -> Response {
             let _ = fs::mkdir(&path[..i]);
         }
     }
-    match fs::write(&path, body) {
-        Ok(()) => Response::text(200, format!("{path}: {} bytes", body.len())),
+    // Saved means on the disk: a new boot image left in the write cache was lost when the
+    // following reboot hung, and the stick no longer booted.
+    match fs::write(&path, body).map_err(|e| format!("{e}")).and_then(|()| fs::sync().map_err(String::from)) {
+        Ok(_) => Response::text(200, format!("{path}: {} bytes", body.len())),
         Err(e) => Response::text(409, format!("{path}: {e}")),
     }
 }

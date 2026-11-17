@@ -22,6 +22,11 @@ const IC_STATUS: usize = 0x70;
 const IC_RXFLR: usize = 0x78;
 const IC_ENABLE_STATUS: usize = 0x9C;
 const IC_COMP_TYPE: usize = 0xFC;
+const IC_TX_ABRT_SOURCE: usize = 0x80;
+/// IC_ENABLE: abort the transfer (sends STOP, flushes the queues; the bit clears itself).
+const ENABLE_ABORT: u32 = 1 << 1;
+/// Reads in flight at most: below the receive FIFO depth.
+const RX_ROOM: usize = 56;
 /// The DesignWare core signature in the type register.
 const DESIGNWARE: u32 = 0x4457_0140;
 /// The reset release register in the controller's private area.
@@ -74,6 +79,25 @@ fn power_on(d: &Device) {
 pub struct Bus {
     mmio: usize,
     fast: bool,
+    /// Fast mode timing from the firmware (high, low, SDA hold in controller clocks), if it gives one.
+    timing: Option<(u32, u32, u32)>,
+    /// The controller's number in the firmware tables (I2C0…I2C5).
+    pub index: Option<u8>,
+}
+
+/// Bus recoveries (a transfer left the controller holding the bus) and the last failure — for `touchpad`.
+pub static RECOVERIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_FAILURE: crate::sync::IrqLock<String> = crate::sync::IrqLock::new(String::new());
+
+/// `touchpad slow`: standard mode (100 kHz) on every bus, to check whether a device copes with 400 kHz.
+static FORCE_SLOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn force_slow(on: bool) {
+    FORCE_SLOW.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn last_failure() -> String {
+    LAST_FAILURE.lock().clone()
 }
 
 /// The touchpad driver and the probe both use the bus: the exchanges must not interleave.
@@ -86,7 +110,13 @@ impl Bus {
         }
         power_on(d);
         d.write(0x04, d.read(0x04) | 0b110);
-        let bus = Self { mmio: d.mmio(0, 0x1000), fast: false };
+        // Intel LPSS: 00:15.0-3 are I2C0-3, 00:19.0-1 are I2C4-5.
+        let index = match d.slot {
+            0x15 => Some(d.func),
+            0x19 => Some(4 + d.func),
+            _ => None,
+        };
+        let bus = Self { mmio: d.mmio(0, 0x1000), fast: false, timing: None, index };
         bus.wr(LPSS_RESETS, LPSS_OUT_OF_RESET);
         (bus.rd(IC_COMP_TYPE) == DESIGNWARE).then_some(bus)
     }
@@ -116,6 +146,7 @@ impl Bus {
     /// From here on the exchange runs at 400 kHz.
     pub fn set_fast(&mut self) {
         self.fast = true;
+        self.timing = self.index.and_then(firmware_timing);
     }
 
     fn rd(&self, reg: usize) -> u32 {
@@ -126,22 +157,53 @@ impl Bus {
         crate::hwprobe::wr(self.mmio, reg, value)
     }
 
-    fn select(&self, addr: u8) -> Result<(), &'static str> {
+    /// Stops the controller. A transfer cut short (no STOP queued) leaves the master holding the bus,
+    /// and then it does not stop by itself: abort the transfer first.
+    fn stop(&self) -> Result<(), &'static str> {
         self.wr(IC_ENABLE, 0);
+        if self.wait_disabled(WAIT_CYCLES / 10) {
+            return Ok(());
+        }
+        RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.wr(IC_ENABLE, 1 | ENABLE_ABORT);
         let end = crate::hwprobe::deadline(WAIT_CYCLES);
+        while self.rd(IC_ENABLE) & ENABLE_ABORT != 0 && !crate::hwprobe::expired(end) {
+            core::hint::spin_loop();
+        }
+        self.rd(IC_CLR_TX_ABRT);
+        self.wr(IC_ENABLE, 0);
+        if self.wait_disabled(WAIT_CYCLES) { Ok(()) } else { Err("the controller does not stop") }
+    }
+
+    fn wait_disabled(&self, cycles: u64) -> bool {
+        let end = crate::hwprobe::deadline(cycles);
         while self.rd(IC_ENABLE_STATUS) & 1 != 0 {
             if crate::hwprobe::expired(end) {
-                return Err("the controller does not stop");
+                return false;
             }
         }
-        let speed = if self.fast { CON_FAST } else { CON_STANDARD };
+        true
+    }
+
+    /// A failed transfer: remember why and release the bus right away.
+    fn fail(&self, why: &str) {
+        let source = self.rd(IC_TX_ABRT_SOURCE);
+        *LAST_FAILURE.lock() = format!("{why}, abort source {source:#x}, status {:#x}", self.rd(IC_STATUS));
+        self.rd(IC_CLR_TX_ABRT);
+        let _ = self.stop();
+    }
+
+    fn select(&self, addr: u8) -> Result<(), &'static str> {
+        self.stop()?;
+        let speed = if self.fast && !FORCE_SLOW.load(core::sync::atomic::Ordering::Relaxed) { CON_FAST } else { CON_STANDARD };
         self.wr(IC_CON, CON_MASTER | speed | CON_RESTART | CON_NO_SLAVE);
         self.wr(IC_TAR, addr as u32);
         self.wr(IC_SS_HCNT, HALF_PERIOD);
         self.wr(IC_SS_LCNT, HALF_PERIOD);
-        self.wr(IC_FS_HCNT, FAST_HIGH);
-        self.wr(IC_FS_LCNT, FAST_LOW);
-        self.wr(IC_SDA_HOLD, SDA_HOLD);
+        let (high, low, hold) = self.timing.unwrap_or((FAST_HIGH, FAST_LOW, SDA_HOLD));
+        self.wr(IC_FS_HCNT, high);
+        self.wr(IC_FS_LCNT, low);
+        self.wr(IC_SDA_HOLD, if self.fast { hold } else { SDA_HOLD });
         self.wr(IC_INTR_MASK, 0);
         self.wr(IC_ENABLE, 1);
         self.rd(IC_CLR_TX_ABRT);
@@ -158,13 +220,20 @@ impl Bus {
         let end = crate::hwprobe::deadline(WAIT_CYCLES + WAIT_CYCLES / 4 * len as u64 / 8);
         while sent < send.len() || asked < len || out.len() < len {
             if self.rd(IC_RAW_INTR) & RAW_TX_ABORT != 0 {
-                self.rd(IC_CLR_TX_ABRT);
+                self.fail("the device did not answer");
                 return None;
             }
             if crate::hwprobe::expired(end) {
+                self.fail(if asked < len || sent < send.len() { "timed out queueing" } else { "timed out reading" });
                 return None;
             }
-            if self.rd(IC_STATUS) & STATUS_TX_ROOM != 0 {
+            // Queue everything the FIFO takes at once: if this thread is preempted halfway, the
+            // controller still finishes the transfer with its STOP instead of holding the bus.
+            while self.rd(IC_STATUS) & STATUS_TX_ROOM != 0 && (sent < send.len() || asked < len) {
+                // No more reads outstanding than the receive FIFO holds (64 on Intel LPSS).
+                if sent == send.len() && asked - out.len() >= RX_ROOM {
+                    break;
+                }
                 if sent < send.len() {
                     let last = sent + 1 == send.len() && len == 0;
                     self.wr(IC_DATA_CMD, send[sent] as u32 | if last { CMD_STOP } else { 0 });
@@ -190,12 +259,12 @@ impl Bus {
         if len == 0 {
             while self.rd(IC_STATUS) & (STATUS_ACTIVITY | STATUS_TX_EMPTY) != STATUS_TX_EMPTY {
                 if self.rd(IC_RAW_INTR) & RAW_TX_ABORT != 0 || crate::hwprobe::expired(end) {
-                    self.rd(IC_CLR_TX_ABRT);
+                    self.fail("the write did not go through");
                     return None;
                 }
             }
             if self.rd(IC_RAW_INTR) & RAW_TX_ABORT != 0 {
-                self.rd(IC_CLR_TX_ABRT);
+                self.fail("the device refused the write");
                 return None;
             }
         }
@@ -258,6 +327,21 @@ pub fn hid_device(bus: &Bus, addr: u8) -> Option<HidDevice> {
 
 /// All I2C controllers ready for exchange: those the firmware gave no address
 /// get one. `lines` gets what went wrong.
+/// Fast mode timing the firmware gives controller `n` (its FMCN method returns the FMHn, FMLn and
+/// FMDn fields of the GNVS region): the counts it was tuned with for the devices on that bus.
+fn firmware_timing(n: u8) -> Option<(u32, u32, u32)> {
+    let d = crate::acpi::dsdt()?;
+    let (gnvs, _) = crate::aml::memory_region(d, b"GNVS")?;
+    let digit = b'0' + n;
+    let read = |name: [u8; 4]| -> Option<u32> {
+        let (at, _) = crate::aml::field(d, b"GNVS", &name)?;
+        Some(unsafe { core::ptr::read_unaligned((gnvs + at) as *const u16) } as u32)
+    };
+    let (high, low, hold) = (read([b'F', b'M', b'H', digit])?, read([b'F', b'M', b'L', digit])?, read([b'F', b'M', b'D', digit])?);
+    crate::kprintln!("i2c{n}: firmware fast mode timing: high {high}, low {low}, SDA hold {hold} (ours {FAST_HIGH}, {FAST_LOW}, {SDA_HOLD})");
+    (high > 0 && low > 0 && high < 0x1000 && low < 0x1000 && hold < 0x1000).then_some((high, low, hold))
+}
+
 pub fn controllers(devices: &[Device], lines: &mut Vec<String>) -> Vec<(String, Bus)> {
     let mut out = Vec::new();
     let mut free = None;

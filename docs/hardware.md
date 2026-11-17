@@ -44,7 +44,7 @@ Laptop, Intel Comet Lake. Runs as a live system from a USB stick (its NVMe disk 
 | External monitor | HDMI (DDI B through a DP→HDMI converter) | ✅ | Own driver, modes from the monitor EDID |
 | Brightness keys | Fn brightness keys | ❌ | The firmware sends them through an SMI path GlassOS does not handle yet |
 | Keyboard | PS/2 | ✅ | Keyboard backlight (Fn+F5) is handled by the firmware |
-| Touchpad | I2C HID (0488:120a) | ⚠️ | Cursor and clicks work; **multi-touch gestures and two-finger scrolling do not** |
+| Touchpad | I2C HID (0488:120a) | ✅ | Precision Touchpad over I2C: cursor, tap clicks, two-finger scrolling. The driver tells the EC to stop reading the touchpad itself (its PS/2 emulation), as the firmware's HID _DSM does |
 | Storage | NVMe | ❌ | No NVMe driver yet; files live on the boot stick |
 | Wi-Fi | Intel Wi-Fi 6 AX201 | ⚠️ | Experimental driver; copying over Wi-Fi measured at 8–10 MB/s |
 | Bluetooth | Intel AX201 (USB 8087:0026) | ⚠️ | Firmware loads, keyboards pair; key auto-repeat may stick while Wi-Fi is busy |

@@ -91,7 +91,7 @@ const COMMANDS: [(&str, &str, &str); 72] = [
     ("System", "monitor", "monitor off|on \u{2014} act as if the cable of screen 2 was pulled or plugged"),
     ("System", "lsusb", "lsusb \u{2014} USB devices"),
     ("System", "irq", "irq \u{2014} device interrupts (MSI): vector, device, count"),
-    ("System", "touchpad", "touchpad [on|off] \u{2014} touchpad state; off returns the plain mouse after a restart"),
+    ("System", "touchpad", "touchpad [on|off|trace|slow|fast|dsdt] \u{2014} touchpad state; off returns the plain mouse after a restart; trace: the last reads and frames; slow/fast: I2C at 100/400 kHz; dsdt: save the ACPI table to /tmp/dsdt.aml"),
     ("System", "reboot", "reboot [now|bios|usb] \u{2014} restart; windows with unsaved work ask first, now does not wait; bios opens the firmware setup, usb starts once from the USB stick"),
     ("System", "shutdown", "shutdown [now] \u{2014} turn the computer off; windows with unsaved work ask first, now does not wait"),
     ("System", "mem", "mem \u{2014} kernel memory"),
@@ -1419,6 +1419,23 @@ impl Shell {
                 }
             }
             "touchpad" => match arg {
+                "trace" => {
+                    for line in crate::touchpad::trace() {
+                        self.print(line);
+                    }
+                }
+                "dsdt" => match crate::acpi::dsdt() {
+                    // The firmware's ACPI table with the touchpad's bus speed and pins: for debugging.
+                    Some(d) => match crate::fs::write("/tmp/dsdt.aml", d) {
+                        Ok(()) => self.print(format!("touchpad: DSDT ({} bytes) saved to /tmp/dsdt.aml", d.len())),
+                        Err(e) => self.print(format!("touchpad: {e}")),
+                    },
+                    None => self.print("touchpad: no DSDT"),
+                },
+                word @ ("slow" | "fast") => {
+                    crate::i2c::force_slow(word == "slow");
+                    self.print(format!("touchpad: I2C at {} kHz from now on", if word == "slow" { 100 } else { 400 }));
+                }
                 word @ ("on" | "off") => match crate::touchpad::set_enabled(word == "on") {
                     Ok(()) => self.print(format!("touchpad driver {word} after a restart")),
                     Err(e) => self.print(format!("touchpad: {e}")),

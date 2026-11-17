@@ -130,26 +130,25 @@ def logo(size):
 
 
 def preview(w, h):
+    """Everything centred and well inside the edges: link previews crop the image (to 1.91:1, or to a
+    square in small thumbnails), so nothing important may sit near the sides."""
     S = 2
     W, H = w * S, h * S
     img = wallpaper(W, H, 3, density=26000)
-    box = (W * 0.06, H * 0.17, W * 0.94, H * 0.83)
+    box = (W * 0.17, H * 0.08, W * 0.83, H * 0.92)
     rad = H * 0.07
     img = shadow(img, box, rad, H * 0.04)
     img = glass(img, box, rad, H * 0.035, alpha=28)
     dots(img, box[0] + H * 0.06, box[1] + H * 0.06, H * 0.013)
-    # The icon on the left of the card.
-    icon = logo(int(H * 0.40))
-    ix, iy = int(box[0] + H * 0.09), int((H - icon.size[1]) / 2)
-    img.paste(icon, (ix, iy), icon)
+    icon = logo(int(H * 0.30))
+    img.paste(icon, (int((W - icon.size[0]) / 2), int(H * 0.15)), icon)
     d = ImageDraw.Draw(img)
-    tx = ix + icon.size[0] + H * 0.07
-    title = ImageFont.truetype(SEMI, int(H * 0.15))
-    sub = ImageFont.truetype(REG, int(H * 0.044))
-    small = ImageFont.truetype(REG, int(H * 0.034))
-    d.text((tx, H * 0.30), "GlassOS", font=title, fill=(240, 250, 255))
-    d.text((tx, H * 0.505), "An operating system written from scratch by an AI", font=sub, fill=(0xC3, 0xC8, 0xD8))
-    d.text((tx, H * 0.585), "Rust kernel  ·  own drivers  ·  frosted-glass desktop  ·  Lua apps", font=small, fill=ACCENT)
+    def centred(y, text, font, fill):
+        bb = d.textbbox((0, 0), text, font=font)
+        d.text(((W - (bb[2] - bb[0])) / 2 - bb[0], y), text, font=font, fill=fill)
+    centred(H * 0.48, "GlassOS", ImageFont.truetype(SEMI, int(H * 0.13)), (240, 250, 255))
+    centred(H * 0.67, "An operating system written from scratch by an AI", ImageFont.truetype(REG, int(H * 0.040)), (0xC3, 0xC8, 0xD8))
+    centred(H * 0.75, "Rust kernel  ·  own drivers  ·  glass desktop  ·  Lua apps", ImageFont.truetype(REG, int(H * 0.032)), ACCENT)
     return img.resize((w, h), Image.LANCZOS)
 
 

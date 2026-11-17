@@ -66,11 +66,12 @@ a sound recorder, and Lua programs such as a music player.
 | Machine | Status |
 |---|---|
 | QEMU/KVM, q35 + OVMF | The development VM: everything except real-hardware drivers |
-| GIGABYTE BRIX (Celeron N2807, Bay Trail) | The main test machine: display, SATA, RTL8168, RTL8723BE Wi-Fi and Bluetooth, HDA, watchdog |
-| Dell Latitude 7410 (Comet Lake) | Touchpad, HDMI, backlight, battery, Intel AX201 (experimental) |
+| GIGABYTE BRIX (Celeron N2807, Bay Trail) | The main test machine: display, SATA, Ethernet, Wi-Fi, Bluetooth, watchdog |
+| Dell Latitude 7410 (Comet Lake) | Live from USB: HDMI, Wi-Fi, Bluetooth, battery; touchpad without gestures |
 
-Other UEFI PCs usually boot to the desktop with the firmware's framebuffer; drivers are a matter of
-luck. Please send a [hardware report](CONTRIBUTING.md#hardware-reports) for your machine.
+What works on each machine, part by part, is in [docs/hardware.md](docs/hardware.md). Other UEFI PCs
+usually boot to the desktop with the firmware's framebuffer; drivers are a matter of luck. Please
+send a [hardware report](CONTRIBUTING.md#hardware-reports) for your machine — it will be added there.
 
 ## Trying it
 
@@ -109,6 +110,7 @@ drive a GlassOS machine directly. See [docs/remote-protocol.md](docs/remote-prot
 - [Remote access protocol](docs/remote-protocol.md)
 - [Instructions for AI agents](AGENTS.md)
 - [Contributing and hardware reports](CONTRIBUTING.md)
+- [Hardware compatibility](docs/hardware.md)
 - [Known issues](docs/known-issues.md)
 
 ## Plans

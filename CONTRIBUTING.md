@@ -25,7 +25,8 @@ stick GlassOS booted from.
    the screen instead.
 5. **Check and send.** Shut down (menu → Shut down), take the stick to another computer and look at
    the `glassos-hw` folder. Then open an issue named "Hardware: <vendor and model>" and attach the
-   folder (zipped), plus a few words: what works, what does not, what you expected.
+   folder (zipped), plus a few words: what works, what does not, what you expected. The machine
+   then gets an entry in [docs/hardware.md](docs/hardware.md).
 
 The report contains the network card MAC addresses, the names of Wi-Fi networks seen nearby,
 the local IP addresses and the monitor's serial number (in the EDID). Remove what you do not want

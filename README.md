@@ -83,6 +83,7 @@ and Python 3.
 ./run.sh --help             # options: --pulse HOST:PORT for sound, --hda, --bridge, --name ...
 python3 tools/mkimage.py    # target/glassos.img — a bootable USB image (write it with dd/Rufus/Etcher)
 python3 tools/mkiso.py      # target/glassos.iso — needs xorriso; works with Ventoy
+tools/build-release.sh      # both images the way they are published in Releases
 ```
 
 The kernel log goes to `target/serial.log`. On real hardware, boot the image in UEFI mode with

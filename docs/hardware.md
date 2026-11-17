@@ -48,7 +48,7 @@ Laptop, Intel Comet Lake. Runs as a live system from a USB stick (its NVMe disk 
 | Wi-Fi | Intel Wi-Fi 6 AX201 | ⚠️ | Experimental driver; copying over Wi-Fi measured at 8–10 MB/s |
 | Bluetooth | Intel AX201 (USB 8087:0026) | ⚠️ | Firmware loads, keyboards pair; key auto-repeat may stick while Wi-Fi is busy |
 | Battery, lid | Embedded controller | ✅ | Charge, time left, lid closes the screen |
-| Sound | Intel HDA / Smart Sound | ❔ | |
+| Sound | Intel HDA | ✅ | Built-in speakers; headphone jack and microphone not verified |
 | Power | | ⚠️ | No sleep/hibernate; deep C-states not verified |
 
 ## QEMU/KVM

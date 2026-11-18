@@ -15,6 +15,10 @@ layer underneath.
 It is not meant for daily use. Expect bugs, missing drivers and data you would not want to lose
 kept somewhere else.
 
+![The GlassOS desktop: Files, the image viewer, a clock and the program menu](docs/images/screenshots/desktop.png)
+
+More screenshots: [docs/screenshots.md](docs/screenshots.md).
+
 ## Ideas behind it
 
 - **Its own system, not another Unix.** No POSIX compatibility layer, no fork/exec. Built-in
